@@ -90,7 +90,7 @@ pub async fn start_proxy<P1, P2, P3>(
     socket_path: P1,
     docker_socket: P2,
     config: Config,
-    config_path: P3,
+    config_path: P3
 ) -> Result<()>
 where
     P1: AsRef<Path> + std::fmt::Debug + 'static,
@@ -113,6 +113,7 @@ where
     // Create a shared configuration that can be updated
     let shared_config = SharedConfig::new(config);
 
+    // Print a warning if the default version endpoint rule is enabled
     // Set up the configuration file watcher
     let watcher_config = shared_config.clone();
     let config_path_for_watcher = config_path_owned.clone();
@@ -321,6 +322,7 @@ async fn handle_request(
                     "Forwarding request: method={}, path={}, from pid={}, binary={}",
                     method, path, process_info.pid, process_info.binary
                 );
+
                 logging::log_request(
                     method.as_str(),
                     &path,
@@ -340,13 +342,24 @@ async fn handle_request(
                     .body(body)
                     .unwrap();
 
+                // Get the matching rule that allowed this request
+                let matching_rule = if let Some(rule_index) = result.matching_rule_index {
+                    if rule_index < config.rules.len() {
+                        Some(&config.rules[rule_index])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // Forward the request to the Docker socket
                 match client.request(docker_req).await {
                     Ok(resp) => {
                         debug!("Received response from Docker: status={}", resp.status());
 
-                        // Check if any rule has response_rules
-                        let has_response_rules = config.rules.iter().any(|rule| {
+                        // Check if the matching rule has response_rules
+                        let has_response_rules = matching_rule.map_or(false, |rule| {
                             if let Some(rules) = &rule.response_rules {
                                 !rules.is_empty()
                             } else {
@@ -374,48 +387,28 @@ async fn handle_request(
                                 Err(_) => None, // Not JSON or invalid JSON
                             };
 
-                            // Check response rules if we have JSON
-                            if let Some(json) = json_body {
-                                for rule in &config.rules {
-                                    if let Some(response_rules) = &rule.response_rules {
-                                        if !response_rules.is_empty() {
-                                            // Check each response rule
-                                            for (path, expected_value) in response_rules {
-                                                // Use JsonPathFinder to evaluate the JSON path
-                                                let finder = match jsonpath_rust::JsonPathFinder::from_str(&json.to_string(), path) {
-                                                    Ok(finder) => finder,
-                                                    Err(e) => {
-                                                        debug!("Failed to create JsonPathFinder for response: {}", e);
-                                                        continue; // Skip this rule
-                                                    }
-                                                };
-
-                                                let found_values = finder.find();
-
-                                                // Check if the found value matches the expected value
-                                                let condition_matched = match found_values {
-                                                    serde_json::Value::Array(values) => {
-                                                        // If the result is an array, check if any value matches the expected value
-                                                        values.iter().any(|found| {
-                                                            debug!("Checking response rule: {} = {}", path, found);
-                                                            found == expected_value
-                                                        })
-                                                    }
-                                                    _ => {
-                                                        // If the result is not an array, check if it matches the expected value
-                                                        debug!("Checking response rule: {} = {}", path, found_values);
-                                                        &found_values == expected_value
-                                                    }
-                                                };
-
-                                                if !condition_matched {
-                                                    debug!("Response rule mismatch: {} != {:?}", path, expected_value);
+                            // Check response rules if we have JSON and a matching rule
+                            if let (Some(json), Some(rule)) = (json_body, matching_rule) {
+                                if let Some(response_rules) = &rule.response_rules {
+                                    if !response_rules.is_empty() {
+                                        match rule.matches_response_rules(&json) {
+                                            Ok(matched) => {
+                                                if !matched {
+                                                    debug!("Response rule mismatch for rule: endpoint={}", rule.endpoint);
                                                     // If a response rule doesn't match, deny the request
                                                     return Ok(Response::builder()
                                                         .status(StatusCode::FORBIDDEN)
                                                         .body(Body::from("Response denied by access control rules"))
                                                         .unwrap());
                                                 }
+                                            },
+                                            Err(e) => {
+                                                debug!("Error checking response rules: {}", e);
+                                                // If there's an error checking the rules, deny the request
+                                                return Ok(Response::builder()
+                                                    .status(StatusCode::FORBIDDEN)
+                                                    .body(Body::from("Error checking response rules"))
+                                                    .unwrap());
                                             }
                                         }
                                     }

@@ -9,8 +9,8 @@ set(RUST_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 set(TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Custom target to build the Rust binary
-add_custom_target(build-rust
-    COMMAND cargo build --release
+add_custom_target(build-rust-debug
+    COMMAND cargo build
     WORKING_DIRECTORY ${RUST_SRC_DIR}
     COMMENT "Building Rust binary..."
 )
@@ -18,9 +18,9 @@ add_custom_target(build-rust
 # Custom target to run the integration tests
 add_custom_target(run-tests
     COMMAND uv pip install -e ${TEST_DIR}[test]
-    COMMAND uv run --project ${TEST_DIR} pytest ${TEST_DIR} -v -s --tb=short | tee ${TEST_DIR}/test_output.log
+    COMMAND ${CMAKE_COMMAND} -E env RUST_LOG=debug uv run --project ${TEST_DIR} pytest ${TEST_DIR} -v -s --tb=short | tee ${TEST_DIR}/test_output.log
     WORKING_DIRECTORY ${TEST_DIR}
-    DEPENDS build-rust
+    DEPENDS build-rust-debug
 )
 
 # Set run_tests as the default target when building in this directory

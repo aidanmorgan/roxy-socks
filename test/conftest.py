@@ -160,8 +160,11 @@ def roxy_process(roxy_binary, roxy_config, roxy_socket, roxy_log_dir):
         "--log-rotation", "never",
     ]
 
+    new_env = os.environ.copy()
+    new_env["RUST_LOG"] = "debug"
+
     logger.info(f"Starting roxy process with command: {cmd}")
-    process = subprocess.Popen(cmd)
+    process = subprocess.Popen(cmd, env=new_env)
     logger.info(f"Started roxy process with PID: {process.pid}")
 
     # Wait for the socket to be created

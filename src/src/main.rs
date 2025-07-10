@@ -3,7 +3,8 @@ use std::process as std_process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use crate::rules::{QueryParamMatch, Rule};
 
 mod buffered_request;
 mod config;
@@ -34,12 +35,16 @@ struct Args {
     log_dir: PathBuf,
 
     /// Timeout in seconds for network operations
-    #[arg(short, long, default_value = "5")]
+    #[arg(short, long, default_value = "10")]
     timeout: u64,
 
     /// Log rotation duration (hourly, daily, never)
     #[arg(short = 'r', long, default_value = "daily")]
     log_rotation: String,
+
+    /// Disable the default rule that allows GET requests to the /version endpoint
+    #[arg(long, action = clap::ArgAction::SetFalse)]
+    disable_version_endpoint: bool,
 }
 
 #[tokio::main]
@@ -59,6 +64,39 @@ async fn main() -> Result<()> {
     let mut config = config::load_config(&args.config_path)
         .context("Failed to load configuration")?;
 
+    if !args.disable_version_endpoint {
+        if !config.rules.iter().any(|rule| rule.endpoint == String::from("/version")) {
+            config.rules.push(Rule {
+                endpoint: String::from("/version"),
+                methods: vec![String::from("GET")],
+                allow: true,
+                request_rules: None,
+                response_rules: None,
+                process_binaries: None,
+                path_variables: None,
+                path_regex: None,
+                match_query_params: QueryParamMatch::Ignore,
+                query_params: None,
+            });
+
+            config.rules.push(Rule {
+                endpoint: String::from("/v1.*/version"),
+                methods: vec![String::from("GET")],
+                allow: true,
+                request_rules: None,
+                response_rules: None,
+                process_binaries: None,
+                path_variables: None,
+                path_regex: None,
+                match_query_params: QueryParamMatch::Ignore,
+                query_params: None,
+            });
+
+
+            warn!("Default rule allowing GET requests to /version endpoint is enabled. Use --disable-version-endpoint to disable this behavior.");
+        }
+    }
+
     // Override timeout with command line argument if provided
     config.timeout = args.timeout;
 
@@ -66,7 +104,12 @@ async fn main() -> Result<()> {
     info!("Configuration: {:?}", config);
 
     // Start the proxy server
-    match proxy::start_proxy(args.socket_path, args.docker_socket, config, args.config_path.clone()).await {
+    match proxy::start_proxy(
+        args.socket_path, 
+        args.docker_socket, 
+        config, 
+        args.config_path.clone()
+    ).await {
         Ok(_) => {
             info!("Proxy server stopped gracefully");
             Ok(())

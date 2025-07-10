@@ -25,6 +25,10 @@ pub fn parse_rotation(rotation: &str) -> Result<Rotation> {
 /// 
 /// * `log_dir` - Directory where log files will be stored
 /// * `rotation` - Log rotation duration (HOURLY, DAILY, NEVER)
+/// 
+/// # Environment Variables
+/// 
+/// * `RUST_LOG` - Sets the log level (trace, debug, info, warn, error). Defaults to "info" if not set.
 pub fn init<P: AsRef<Path>>(log_dir: P, rotation: Rotation) -> Result<()> {
     let log_dir = log_dir.as_ref();
 
@@ -49,8 +53,8 @@ pub fn init<P: AsRef<Path>>(log_dir: P, rotation: Rotation) -> Result<()> {
                 .with_writer(std::io::stdout)
                 .with_span_events(FmtSpan::CLOSE)
                 .with_filter(
-                    EnvFilter::from_default_env()
-                        .add_directive(Level::INFO.into()),
+                    EnvFilter::try_from_env("RUST_LOG")
+                        .unwrap_or_else(|_| EnvFilter::new("info")),
                 ),
         )
         .with(
@@ -58,8 +62,8 @@ pub fn init<P: AsRef<Path>>(log_dir: P, rotation: Rotation) -> Result<()> {
                 .with_writer(non_blocking)
                 .with_span_events(FmtSpan::CLOSE)
                 .with_filter(
-                    EnvFilter::from_default_env()
-                        .add_directive(Level::DEBUG.into()),
+                    EnvFilter::try_from_env("RUST_LOG")
+                        .unwrap_or_else(|_| EnvFilter::new("info")),
                 ),
         );
 

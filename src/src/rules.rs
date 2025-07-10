@@ -8,6 +8,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, trace};
 
+
+/// Checks if a string is intended to be a regex pattern.
+/// 
+/// This function first checks if the string contains common regex special characters.
+/// If it does, it attempts to compile the string as a regex to verify it's valid.
+/// 
+/// # Arguments
+/// 
+/// * `pattern` - The string to check
+/// 
+/// # Returns
+/// 
+/// * `true` if the string is a valid regex pattern
+/// * `false` if the string is not a valid regex pattern or doesn't contain regex special characters
+pub fn is_regex(pattern: &str) -> bool {
+    // Check if the string contains common regex special characters
+    let has_special_chars = pattern.contains('*') || 
+                           pattern.contains('+') || 
+                           pattern.contains('?') || 
+                           pattern.contains('[') || 
+                           pattern.contains(']') || 
+                           pattern.contains('(') || 
+                           pattern.contains(')') || 
+                           pattern.contains('^') || 
+                           pattern.contains('$') || 
+                           pattern.contains('|') || 
+                           pattern.contains('\\') || 
+                           pattern.contains('.');
+
+    // If it has special characters, try to compile it as a regex
+    if has_special_chars {
+        match Regex::new(pattern) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    } else {
+        // If it doesn't have special characters, it's not intended to be a regex
+        false
+    }
+}
+
 /// Enum for controlling how query parameters are matched
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +76,8 @@ pub struct RuleCheckResult {
     pub allowed: bool,
     /// Information about the rule that caused the decision, if any
     pub rule_info: Option<String>,
+    /// Index of the rule that matched the request
+    pub matching_rule_index: Option<usize>,
 }
 
 use crate::buffered_request::BufferedRequest;
@@ -162,14 +205,46 @@ impl Default for Rule {
 impl Rule {
     /// Check if the path matches the rule
     fn matches_path(&self, path: &str) -> Result<bool> {
-        // If path_regex is specified, use it for matching
+        // Extract the path without query parameters for matching
+        let path_without_query = path.split('?').next().unwrap_or(path);
+
+        debug!("Path matching - Path: {}", path);
+        debug!("Path matching - Path without Query: {}", path_without_query);
+        debug!("Path matching - Endpoint: {}", self.endpoint);
+        debug!("Path matching - Path regex: {:?}", self.path_regex);
+        debug!("Path matching - Path variables: {:?}", self.path_variables);
+
+        // If path_regex is specified, use it for matching the full path (including query params)
         if let Some(regex_pattern) = &self.path_regex {
-            let regex = Regex::new(regex_pattern).context("Invalid regex pattern")?;
-            if !regex.is_match(path) {
-                trace!("Path regex mismatch: {} doesn't match pattern {}", path, regex_pattern);
-                return Ok(false);
+            // Check if it's a valid regex pattern
+            if is_regex(regex_pattern) {
+                match Regex::new(regex_pattern) {
+                    Ok(regex) => {
+                        if !regex.is_match(path) {
+                            trace!("Path regex mismatch: {} doesn't match pattern {}", path, regex_pattern);
+                            return Ok(false);
+                        }
+                        debug!("Path regex match: {} matches pattern {}", path, regex_pattern);
+                    },
+                    Err(e) => {
+                        trace!("Invalid regex pattern in path_regex: {}", e);
+                        // If it's not a valid regex, treat it as a literal string
+                        if path != regex_pattern {
+                            trace!("Path literal mismatch: {} != {}", path, regex_pattern);
+                            return Ok(false);
+                        }
+                        debug!("Path literal match: {} == {}", path, regex_pattern);
+                    }
+                }
+            } else {
+                // Not intended to be a regex, treat as literal string
+                if path != regex_pattern {
+                    trace!("Path literal mismatch: {} != {}", path, regex_pattern);
+                    return Ok(false);
+                }
+                debug!("Path literal match: {} == {}", path, regex_pattern);
             }
-        } 
+        }
         // Otherwise, use endpoint with variables if specified
         else if let Some(variables) = &self.path_variables {
             // For simple cases with exact string matching, try a direct approach first
@@ -177,43 +252,60 @@ impl Rule {
                 let (var_name, var_value) = variables.iter().next().unwrap();
                 let placeholder = format!("{{{}}}", var_name);
 
-                // Try to compile the string as a regex to see if it's a valid pattern
-                // If it fails, it's not a regex pattern and we can use simple string replacement
-                if Regex::new(var_value).is_err() {
+                // Extract the variable value from the path
+                let endpoint_parts: Vec<&str> = self.endpoint.split(&placeholder).collect();
+                if endpoint_parts.len() == 2 {
+                    let prefix = endpoint_parts[0];
+                    let suffix = endpoint_parts[1];
 
-                    let exact_path = self.endpoint.replace(&placeholder, var_value);
-                    if path == exact_path {
-                        // Skip the regex approach for simple exact matches
-                        debug!("Exact path match: {} == {}", path, exact_path);
-                        // Continue with other checks (method, process binary, etc.)
-                    } else {
-                        trace!("Exact path mismatch: {} != {}", path, exact_path);
-                        return Ok(false);
-                    }
-                } else {
-                    // For regex patterns, fall through to the regex approach
-                    let mut regex_pattern = "^".to_string();
+                    // Check if the path starts with the prefix and ends with the suffix
+                    if path_without_query.starts_with(prefix) && path_without_query.ends_with(suffix) {
+                        // Extract the variable value from the path
+                        let var_start = prefix.len();
+                        let var_end = path_without_query.len() - suffix.len();
+                        if var_start <= var_end {
+                            let extracted_value = &path_without_query[var_start..var_end];
 
-                    // Split the endpoint by the placeholder
-                    let parts: Vec<&str> = self.endpoint.split(&placeholder).collect();
-                    if parts.len() == 2 {
-                        // Escape the parts and join with the regex pattern
-                        regex_pattern.push_str(&regex::escape(parts[0]));
-                        regex_pattern.push_str(&format!("({})", var_value));
-                        regex_pattern.push_str(&regex::escape(parts[1]));
-                        regex_pattern.push_str("$");
-
-                        // Create regex and match against the path
-                        let regex = Regex::new(&regex_pattern).context("Invalid regex pattern from path variable")?;
-                        if !regex.is_match(path) {
-                            trace!("Path regex mismatch: {} doesn't match pattern {}", path, regex_pattern);
+                            // Check if the extracted value matches the variable pattern
+                            if is_regex(var_value) {
+                                match Regex::new(var_value) {
+                                    Ok(regex) => {
+                                        if !regex.is_match(extracted_value) {
+                                            trace!("Path variable mismatch: {} doesn't match pattern {}", extracted_value, var_value);
+                                            return Ok(false);
+                                        }
+                                        debug!("Path variable match: {} matches pattern {}", extracted_value, var_value);
+                                    },
+                                    Err(e) => {
+                                        trace!("Invalid regex pattern in path variable: {}", e);
+                                        // If it's not a valid regex, do a literal comparison
+                                        if extracted_value != var_value {
+                                            trace!("Path variable literal mismatch: {} != {}", extracted_value, var_value);
+                                            return Ok(false);
+                                        }
+                                        debug!("Path variable literal match: {} == {}", extracted_value, var_value);
+                                    }
+                                }
+                            } else {
+                                // Not intended to be a regex, do a literal comparison
+                                if extracted_value != var_value {
+                                    trace!("Path variable literal mismatch: {} != {}", extracted_value, var_value);
+                                    return Ok(false);
+                                }
+                                debug!("Path variable literal match: {} == {}", extracted_value, var_value);
+                            }
+                        } else {
+                            trace!("Invalid path variable extraction: start {} > end {}", var_start, var_end);
                             return Ok(false);
                         }
                     } else {
-                        // Shouldn't happen, but handle it gracefully
-                        trace!("Invalid placeholder format in endpoint: {}", self.endpoint);
+                        trace!("Path doesn't match endpoint pattern: {} doesn't match {}...{}", path_without_query, prefix, suffix);
                         return Ok(false);
                     }
+                } else {
+                    // Shouldn't happen, but handle it gracefully
+                    trace!("Invalid placeholder format in endpoint: {}", self.endpoint);
+                    return Ok(false);
                 }
             } else {
                 // For multiple variables, use a more complex regex approach
@@ -223,22 +315,61 @@ impl Rule {
                 // Replace each variable placeholder with a capture group
                 for (var_name, var_value) in variables {
                     let placeholder = format!("{{{}}}", var_name);
-                    let capture_group = format!("({})", var_value);
+                    // Check if var_value is a valid regex pattern
+                    let capture_group = if is_regex(var_value) && Regex::new(var_value).is_ok() {
+                        format!("({})", var_value)
+                    } else {
+                        // If it's not a valid regex, escape it to treat it as a literal string
+                        format!("({})", regex::escape(var_value))
+                    };
                     pattern_str = pattern_str.replace(&placeholder, &capture_group);
                 }
 
                 // Create a regex from the pattern
                 let regex = Regex::new(&format!("^{}$", pattern_str)).context("Invalid regex pattern from multiple path variables")?;
-                if !regex.is_match(path) {
-                    trace!("Path regex mismatch: {} doesn't match pattern ^{}$", path, pattern_str);
+                if !regex.is_match(path_without_query) {
+                    trace!("Path regex mismatch: {} doesn't match pattern ^{}$", path_without_query, pattern_str);
                     return Ok(false);
+                }
+                debug!("Path regex match: {} matches pattern ^{}$", path_without_query, pattern_str);
+            }
+        }
+        // Check if the endpoint is intended to be a regex
+        else if is_regex(&self.endpoint) {
+            // Try to compile it as a regex
+            match Regex::new(&self.endpoint) {
+                Ok(_) => {
+                    // Endpoint is a valid regex pattern, use regex matching
+                    let regex_pattern = if !self.endpoint.starts_with('^') {
+                        format!("^{}", self.endpoint)
+                    } else {
+                        self.endpoint.clone()
+                    };
+
+                    let regex = Regex::new(&regex_pattern).context("Invalid regex pattern in endpoint")?;
+                    if !regex.is_match(path_without_query) {
+                        trace!("Endpoint regex mismatch: {} doesn't match pattern {}", path_without_query, regex_pattern);
+                        return Ok(false);
+                    }
+                    debug!("Endpoint regex match: {} matches pattern {}", path_without_query, regex_pattern);
+                },
+                Err(e) => {
+                    trace!("Invalid regex pattern in endpoint: {}", e);
+                    // If it's not a valid regex, fall back to prefix matching
+                    if !path_without_query.starts_with(&self.endpoint) {
+                        trace!("Endpoint mismatch: {} doesn't start with {}", path_without_query, self.endpoint);
+                        return Ok(false);
+                    }
+                    debug!("Endpoint prefix match: {} starts with {}", path_without_query, self.endpoint);
                 }
             }
         }
         // Otherwise, use the original endpoint matching
-        else if !path.starts_with(&self.endpoint) {
-            trace!("Endpoint mismatch: {} != {}", path, self.endpoint);
+        else if !path_without_query.starts_with(&self.endpoint) {
+            trace!("Endpoint mismatch: {} doesn't start with {}", path_without_query, self.endpoint);
             return Ok(false);
+        } else {
+            debug!("Endpoint prefix match: {} starts with {}", path_without_query, self.endpoint);
         }
 
         Ok(true)
@@ -246,6 +377,10 @@ impl Rule {
 
     /// Check if the query parameters match the rule
     fn matches_query_params(&self, query: Option<&str>) -> Result<bool> {
+        debug!("Query params matching - Match type: {:?}", self.match_query_params);
+        debug!("Query params matching - Query string: {:?}", query);
+        debug!("Query params matching - Rule query params: {:?}", self.query_params);
+
         if self.match_query_params != QueryParamMatch::Ignore {
             if let Some(query_params) = &self.query_params {
                 if !query_params.is_empty() {
@@ -266,21 +401,32 @@ impl Rule {
 
                         // Check each query parameter against the regex pattern
                         for (param_name, pattern) in query_params {
-                            let regex = match Regex::new(pattern) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    trace!("Invalid regex pattern for query parameter {}: {}", param_name, e);
-                                    return Ok(false);
+                            // Check if pattern is intended to be a regex
+                            let regex = if is_regex(pattern) {
+                                match Regex::new(pattern) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        trace!("Invalid regex pattern for query parameter {}: {}", param_name, e);
+                                        return Ok(false);
+                                    }
                                 }
+                            } else {
+                                // If not intended to be a regex, create a regex that matches the literal string
+                                Regex::new(&format!("^{}$", regex::escape(pattern))).unwrap()
                             };
 
-                            // Create regex for parameter name
-                            let name_regex = match Regex::new(param_name) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    trace!("Invalid regex pattern for parameter name {}: {}", param_name, e);
-                                    return Ok(false);
+                            // Check if param_name is intended to be a regex
+                            let name_regex = if is_regex(param_name) {
+                                match Regex::new(param_name) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        trace!("Invalid regex pattern for parameter name {}: {}", param_name, e);
+                                        return Ok(false);
+                                    }
                                 }
+                            } else {
+                                // If not intended to be a regex, create a regex that matches the literal string
+                                Regex::new(&format!("^{}$", regex::escape(param_name))).unwrap()
                             };
 
                             // Find the parameter in the query string using regex for parameter name
@@ -322,18 +468,28 @@ impl Rule {
 
     /// Check if the HTTP method matches the rule
     fn matches_method(&self, method: &Method) -> bool {
+        let method_str = method.as_str();
+        debug!("Method matching - Request method: {}", method_str);
+        debug!("Method matching - Allowed methods: {:?}", self.methods);
+
         if !self.methods.is_empty() {
-            let method_str = method.as_str();
             if !self.methods.iter().any(|m| m == method_str) {
                 trace!("Method mismatch: {} not in {:?}", method_str, self.methods);
                 return false;
             }
+            debug!("Method match: {} is in allowed methods", method_str);
+        } else {
+            debug!("Method matching skipped: no methods specified in rule");
         }
         true
     }
 
     /// Check if the process binary matches the rule
     fn matches_process_binary(&self, process_info: &ProcessInfo) -> bool {
+        debug!("Process matching - Process binary: {}", process_info.binary);
+        debug!("Process matching - Process PID: {}", process_info.pid);
+        debug!("Process matching - Allowed binaries: {:?}", self.process_binaries);
+
         if let Some(binaries) = &self.process_binaries {
             if !binaries.iter().any(|b| process_info.binary.contains(b)) {
                 trace!(
@@ -343,6 +499,9 @@ impl Rule {
                 );
                 return false;
             }
+            debug!("Process binary match: {} contains one of {:?}", process_info.binary, binaries);
+        } else {
+            debug!("Process matching skipped: no process binaries specified in rule");
         }
         true
     }
@@ -350,28 +509,67 @@ impl Rule {
     /// Check if the rule matches the given request and process info
     #[allow(dead_code)]
     pub async fn matches(&self, req: &Request<Body>, process_info: &ProcessInfo) -> Result<bool> {
+        // Use the generic matches_request method with the Request<Body>
+        self.matches_request(req, process_info, None).await
+    }
+
+    /// Generic method to match a request against a rule
+    /// 
+    /// This method is used by both matches and matches_buffered to avoid code duplication
+    async fn matches_request<T: RequestMatcher>(&self, req: &T, process_info: &ProcessInfo, check_request_rules: Option<&BufferedRequest>) -> Result<bool> {
+        debug!("=== Starting rule matching process ===");
+        debug!("Rule endpoint: {}", self.endpoint);
+        debug!("Rule methods: {:?}", self.methods);
+        debug!("Rule allow: {}", self.allow);
+        debug!("Request path: {}", req.path());
+        debug!("Request method: {}", req.method());
+        debug!("Process binary: {}", process_info.binary);
+        debug!("Check request rules: {}", check_request_rules.is_some());
+
         // Check if the endpoint matches
-        if !self.matches_path(req.uri().path())? {
+        debug!("Checking path match...");
+        if !self.matches_path(req.path())? {
+            debug!("Path match failed - stopping rule evaluation");
             return Ok(false);
         }
+        debug!("Path match succeeded");
 
         // Check if query parameters should be matched
-        if !self.matches_query_params(req.uri().query())? {
+        debug!("Checking query parameters match...");
+        if !self.matches_query_params(req.query())? {
+            debug!("Query parameters match failed - stopping rule evaluation");
             return Ok(false);
         }
+        debug!("Query parameters match succeeded");
 
         // Check if the method matches
+        debug!("Checking method match...");
         if !self.matches_method(req.method()) {
+            debug!("Method match failed - stopping rule evaluation");
             return Ok(false);
         }
+        debug!("Method match succeeded");
 
         // Check process binary
+        debug!("Checking process binary match...");
         if !self.matches_process_binary(process_info) {
+            debug!("Process binary match failed - stopping rule evaluation");
             return Ok(false);
+        }
+        debug!("Process binary match succeeded");
+
+        // Check request rules if specified and we have a BufferedRequest
+        if let Some(buffered_req) = check_request_rules {
+            debug!("Checking request rules match...");
+            if !self.matches_request_rules(buffered_req)? {
+                debug!("Request rules match failed - stopping rule evaluation");
+                return Ok(false);
+            }
+            debug!("Request rules match succeeded");
         }
 
         debug!(
-            "Rule matched: endpoint={}, methods={:?}, allow={}",
+            "=== Rule matched completely: endpoint={}, methods={:?}, allow={} ===",
             self.endpoint, self.methods, self.allow
         );
         Ok(true)
@@ -385,122 +583,180 @@ pub async fn check_request_buffered(
     rules: &[Rule],
     process_info: &ProcessInfo,
 ) -> Result<RuleCheckResult> {
+    debug!("=== Starting rule evaluation for request ===");
+    debug!("Request path: {}", req.path());
+    debug!("Request method: {}", req.method());
+    debug!("Process binary: {}", process_info.binary);
+    debug!("Process PID: {}", process_info.pid);
+    debug!("Total rules to check: {}", rules.len());
+
     // Default to deny if no rules match
     let mut result = RuleCheckResult {
         allowed: false,
         rule_info: None,
+        matching_rule_index: None,
     };
 
-    for rule in rules {
+    for (index, rule) in rules.iter().enumerate() {
+        debug!("Checking rule #{} - endpoint: {}, methods: {:?}, allow: {}", 
+               index, rule.endpoint, rule.methods, rule.allow);
+
         if matches_buffered(rule, req, process_info).await? {
+            debug!("Rule #{} matched! Allow: {}", index, rule.allow);
             // Return immediately when a rule matches
             return Ok(RuleCheckResult {
                 allowed: rule.allow,
                 rule_info: Some(format!("Rule matched: endpoint={}, methods={:?}, allow={}", 
                                        rule.endpoint, rule.methods, rule.allow)),
+                matching_rule_index: Some(index),
             });
         }
+        debug!("Rule #{} did not match, continuing to next rule", index);
     }
 
     // No rules matched
+    debug!("No rules matched for request path: {}, method: {}", req.path(), req.method());
     result.rule_info = Some("No matching rules".to_string());
+    debug!("=== Completed rule evaluation: no matching rules found ===");
     Ok(result)
 }
 
 impl Rule {
     /// Check if the request rules match using JSON path conditions
-    async fn matches_request_rules(&self, req: &BufferedRequest) -> Result<bool> {
+    fn matches_request_rules(&self, req: &BufferedRequest) -> Result<bool> {
+        debug!("Request rules matching - Method: {}", req.method());
+        debug!("Request rules matching - Rules: {:?}", self.request_rules);
+
         if let Some(rules) = &self.request_rules {
             if !rules.is_empty() {
+                debug!("Request rules matching - Rules count: {}", rules.len());
+
                 // JSON path checking is only applicable for methods that typically have a body
                 let method = req.method();
                 if method == &Method::POST || method == &Method::PUT || method == &Method::PATCH {
+                    debug!("Request rules matching - Method {} supports body checking", method);
+
                     // Parse the body as JSON
+                    debug!("Request rules matching - Parsing request body as JSON");
                     match req.parse_json() {
                         Ok(json) => {
-                            // Check each JSON path condition from request_rules
-                            for (path, expected_value) in rules {
-                                // Use JsonPathFinder to evaluate the JSON path
-                                let finder = match JsonPathFinder::from_str(&json.to_string(), path) {
-                                    Ok(finder) => finder,
-                                    Err(e) => {
-                                        trace!("Failed to create JsonPathFinder: {}", e);
-                                        return Ok(false);
-                                    }
-                                };
-
-                                let found_values = finder.find();
-
-                                // Check if the found value matches the expected value
-                                let condition_matched = match found_values {
-                                    Value::Array(values) => {
-                                        // If the result is an array, check if any value matches the expected value
-                                        values.iter().any(|found| {
-                                            trace!("Checking request rule: {} = {}", path, found);
-                                            found == expected_value
-                                        })
-                                    }
-                                    _ => {
-                                        // If the result is not an array, check if it matches the expected value
-                                        trace!("Checking request rule: {} = {}", path, found_values);
-                                        &found_values == expected_value
-                                    }
-                                };
-
-                                if !condition_matched {
-                                    trace!("Request rule mismatch: {} != {:?}", path, expected_value);
-                                    return Ok(false);
-                                }
+                            debug!("Request rules matching - JSON parsed successfully");
+                            // Use the generic check_json_rules method
+                            if !self.check_json_rules(&json, rules, "request")? {
+                                debug!("Request rules matching - JSON rules check failed");
+                                return Ok(false);
                             }
-
-                            trace!("All request conditions matched");
+                            debug!("Request rules matching - All request conditions matched");
                         }
                         Err(e) => {
-                            trace!("Failed to parse request body as JSON: {}", e);
+                            debug!("Request rules matching - Failed to parse request body as JSON: {}", e);
                             return Ok(false);
                         }
                     }
+                } else {
+                    debug!("Request rules matching - Method {} doesn't typically have a body, skipping JSON checks", method);
                 }
+            } else {
+                debug!("Request rules matching - No rules specified, skipping check");
             }
+        } else {
+            debug!("Request rules matching - No rules specified, skipping check");
         }
 
+        Ok(true)
+    }
+
+    /// Check if the response rules match using JSON path conditions
+    pub fn matches_response_rules(&self, json: &Value) -> Result<bool> {
+        debug!("Response rules matching - JSON: {}", json);
+        debug!("Response rules matching - Rules: {:?}", self.response_rules);
+
+        if let Some(rules) = &self.response_rules {
+            if !rules.is_empty() {
+                debug!("Response rules matching - Rules count: {}", rules.len());
+
+                // Use the generic check_json_rules method
+                debug!("Response rules matching - Checking JSON rules");
+                if !self.check_json_rules(json, rules, "response")? {
+                    debug!("Response rules matching - JSON rules check failed");
+                    return Ok(false);
+                }
+                debug!("Response rules matching - All response conditions matched");
+            } else {
+                debug!("Response rules matching - No rules specified, skipping check");
+            }
+        } else {
+            debug!("Response rules matching - No rules specified, skipping check");
+        }
+
+        Ok(true)
+    }
+
+    /// Generic method to check JSON rules
+    fn check_json_rules(&self, json: &Value, rules: &HashMap<String, Value>, rule_type: &str) -> Result<bool> {
+        debug!("JSON rules checking - Type: {}", rule_type);
+        debug!("JSON rules checking - Rules count: {}", rules.len());
+        debug!("JSON rules checking - JSON: {}", json);
+
+        // Check each JSON path condition
+        for (path, expected_value) in rules {
+            debug!("JSON rules checking - Evaluating path: {}", path);
+            debug!("JSON rules checking - Expected value: {}", expected_value);
+
+            // Use JsonPathFinder to evaluate the JSON path
+            let finder = match JsonPathFinder::from_str(&json.to_string(), path) {
+                Ok(finder) => {
+                    debug!("JSON rules checking - JsonPathFinder created successfully for path: {}", path);
+                    finder
+                },
+                Err(e) => {
+                    debug!("JSON rules checking - Failed to create JsonPathFinder for {}: {}", rule_type, e);
+                    return Ok(false);
+                }
+            };
+
+            let found_values = finder.find();
+            debug!("JSON rules checking - Found values: {}", found_values);
+
+            // Check if the found value matches the expected value
+            let condition_matched = match &found_values {
+                Value::Array(values) => {
+                    // If the result is an array, check if any value matches the expected value
+                    debug!("JSON rules checking - Found array with {} elements", values.len());
+                    let matched = values.iter().any(|found| {
+                        let matches = found == expected_value;
+                        debug!("JSON rules checking - Array element {} == expected {}: {}", found, expected_value, matches);
+                        matches
+                    });
+                    matched
+                }
+                _ => {
+                    // If the result is not an array, check if it matches the expected value
+                    let matches = &found_values == expected_value;
+                    debug!("JSON rules checking - Found value {} == expected {}: {}", found_values, expected_value, matches);
+                    matches
+                }
+            };
+
+            if !condition_matched {
+                debug!("JSON rules checking - Rule mismatch: {} != {:?}", path, expected_value);
+                return Ok(false);
+            }
+            debug!("JSON rules checking - Rule matched: {} == {:?}", path, expected_value);
+        }
+
+        debug!("JSON rules checking - All rules matched successfully");
         Ok(true)
     }
 }
 
 /// Check if a rule matches a buffered request
 async fn matches_buffered(rule: &Rule, req: &BufferedRequest, process_info: &ProcessInfo) -> Result<bool> {
-    // Check if the endpoint matches
-    if !rule.matches_path(req.path())? {
-        return Ok(false);
-    }
-
-    // Check if query parameters should be matched
-    if !rule.matches_query_params(req.query())? {
-        return Ok(false);
-    }
-
-    // Check if the method matches
-    if !rule.matches_method(req.method()) {
-        return Ok(false);
-    }
-
-    // Check process binary
-    if !rule.matches_process_binary(process_info) {
-        return Ok(false);
-    }
-
-    // Check request rules if specified
-    if !rule.matches_request_rules(req).await? {
-        return Ok(false);
-    }
-
-    // All conditions matched
-    debug!(
-        "Rule matched: endpoint={}, methods={:?}, allow={}",
-        rule.endpoint, rule.methods, rule.allow
-    );
-    Ok(true)
+    debug!("Matching buffered request against rule with endpoint: {}", rule.endpoint);
+    // Use the generic matches_request method with the BufferedRequest
+    let result = rule.matches_request(req, process_info, Some(req)).await;
+    debug!("Buffered request match result: {:?}", result);
+    result
 }
 
 #[cfg(test)]
@@ -824,6 +1080,37 @@ mod tests {
 
         // The test should fail because the first path variable doesn't match
         assert!(!rule.matches(&req, &process_info).await.unwrap());
+    }
+
+    #[test]
+    fn test_is_regex() {
+        // Test strings that should be identified as regex patterns
+        assert!(is_regex(r"^/containers/[a-f0-9]+/start$"));
+        assert!(is_regex(r"^\d+$"));
+        assert!(is_regex(r"^(true|false)$"));
+        assert!(is_regex(r".*"));
+        assert!(is_regex(r"[a-z]+"));
+        assert!(is_regex(r"(foo|bar)"));
+        assert!(is_regex(r"foo?"));
+        assert!(is_regex(r"foo+"));
+        assert!(is_regex(r"foo*"));
+
+        // Test strings that should not be identified as regex patterns
+        assert!(!is_regex("simple string"));
+        assert!(!is_regex("/containers/json"));
+        assert!(!is_regex(""));
+        assert!(!is_regex("12345"));
+        assert!(!is_regex("true"));
+        assert!(!is_regex("false"));
+
+        // Test invalid regex patterns (should return false)
+        assert!(!is_regex(r"[unclosed bracket"));
+        assert!(!is_regex(r"(unclosed parenthesis"));
+        assert!(!is_regex(r"invalid\escape"));
+
+        // Test edge cases
+        assert!(!is_regex(r"\"));  // Single backslash is invalid
+        assert!(is_regex(r"\\"));  // Escaped backslash is valid
     }
 
     #[tokio::test]

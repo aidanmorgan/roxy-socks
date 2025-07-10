@@ -47,3 +47,4 @@ regex = "1.9"
 tempfile = "3.8"
 # File watching
 notify = "6.1"
+log = "0.4.27"

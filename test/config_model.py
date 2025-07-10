@@ -40,21 +40,6 @@ class RoxyConfig(BaseModel):
         """Initialize the configuration, ensuring there's always a rule for /version endpoint."""
         super().__init__(**data)
 
-        # Check if there's already a rule for the /version endpoint
-        has_version_rule = any(
-            rule.endpoint == "/version" and "GET" in rule.methods and rule.allow
-            for rule in self.rules
-        )
-
-        # If not, add a default rule to allow GET requests to /version
-        if not has_version_rule:
-            self.rules.append(
-                Rule(
-                    endpoint="/version",
-                    methods=["GET"],
-                    allow=True
-                )
-            )
 
     def to_yaml(self) -> str:
         """Convert the configuration to YAML format."""

@@ -13,21 +13,22 @@ class TestRoxyIntegration:
         # Create the model within the test
         self.config_model = RoxyConfig(rules=[
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/containers/json.*$",
                 methods=["GET"],
-                allow=True
+                allow=True,
             )
         ])
 
         containers = docker_client_with_roxy.containers.list(all=True)
         # Just verify that the request succeeds, we don't care about the actual containers
 
+
     def test_list_containers_with_filters(self, docker_client_with_roxy):
         """Test listing containers with filters."""
         # Create the model within the test
         self.config_model = RoxyConfig(rules=[
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/containers/json.*$",
                 methods=["GET"],
                 allow=True,
                 request_rules={
@@ -46,12 +47,13 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # List containers rule with response_rules
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/v1.*/containers/{container_name}/json",
                 methods=["GET"],
                 allow=True,
                 response_rules={
                     "$[*].State": {"Running": True, "Paused": False}  # Only allow running, non-paused containers
-                }
+                },
+                path_variables = {"container_name": "roxy-test-response-rules-positive"}
             ),
             # Create container rule
             Rule(
@@ -64,21 +66,21 @@ class TestRoxyIntegration:
                 endpoint="/v1.*/containers/{container_id}/start",
                 methods=["POST"],
                 allow=True,
-                path_variables={"container_id": ".*"}
+                path_variables={"container_id": "roxy-test-response-rules-positive"}
             ),
             # Stop container rule
             Rule(
                 endpoint="/v1.*/containers/{container_id}/stop",
                 methods=["POST"],
                 allow=True,
-                path_variables={"container_id": ".*"}
+                path_variables={"container_id": "roxy-test-response-rules-positive"}
             ),
             # Remove container rule
             Rule(
                 endpoint="/v1.*/containers/{container_id}",
                 methods=["DELETE"],
                 allow=True,
-                path_variables={"container_id": ".*"}
+                path_variables={"container_id": "roxy-test-response-rules-positive"}
             )
         ])
 
@@ -113,9 +115,9 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # List containers rule
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
-                allow=True
+                allow=True,
             ),
             # Inspect container rule
             Rule(
@@ -195,7 +197,7 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # Create container rule with privileged=False
             Rule(
-                endpoint="/v1.*/containers/create",
+                endpoint="/v1.*/containers/create.*$",
                 methods=["POST"],
                 allow=True,
                 request_rules={"$.HostConfig.Privileged": False}
@@ -218,9 +220,9 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # List images rule
             Rule(
-                endpoint="/v1.*/images/json",
+                endpoint="/v1.*/images/json.*$",
                 methods=["GET"],
-                allow=True
+                allow=True,
             )
         ])
 
@@ -233,9 +235,9 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # Create container rule
             Rule(
-                endpoint="/v1.*/containers/create",
+                endpoint="/v1.*/containers/create.*$",
                 methods=["POST"],
-                allow=True
+                allow=True,
             ),
             # Inspect container rule
             Rule(
@@ -309,9 +311,9 @@ class TestRoxyIntegration:
         self.config_model = RoxyConfig(rules=[
             # Create container rule
             Rule(
-                endpoint="/v1.*/containers/create",
+                endpoint="/v1.*/containers/create.*$",
                 methods=["POST"],
-                allow=True
+                allow=True,
             ),
             # Inspect container rule with specific regex for container_id
             # This regex matches the full 64-character hex ID format
@@ -545,9 +547,9 @@ class TestRoxyNegative:
         self.config_model = RoxyConfig(rules=[
             # List containers rule
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
-                allow=True
+                allow=True,
             ),
             # List images rule
             Rule(
@@ -567,9 +569,9 @@ class TestRoxyNegative:
         self.config_model = RoxyConfig(rules=[
             # List containers rule
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
-                allow=True
+                allow=True,
             )
         ])
 
@@ -721,7 +723,7 @@ class TestRoxyNegative:
         self.config_model = RoxyConfig(rules=[
             # Create container rule with request_rules
             Rule(
-                endpoint="/v1.*/containers/create",
+                endpoint="/v1.*/containers/create.*$",
                 methods=["POST"],
                 allow=True,
                 request_rules={
@@ -766,7 +768,7 @@ class TestRoxyNegative:
         self.config_model = RoxyConfig(rules=[
             # List containers rule with response_rules
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
                 allow=True,
                 response_rules={

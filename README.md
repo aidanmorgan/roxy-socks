@@ -221,6 +221,27 @@ Logs are stored in the specified log directory (default: `/var/log/roxy`) and in
 
 Logs are rotated based on the specified rotation period (default: daily) to prevent excessive disk usage.
 
+### Log Level
+
+The log level can be set using the `RUST_LOG` environment variable. Valid values are:
+- `trace`: Most verbose, includes all log messages
+- `debug`: Includes debug information useful for development
+- `info`: Default level, includes informational messages
+- `warn`: Only includes warnings and errors
+- `error`: Only includes errors
+
+Example:
+```bash
+RUST_LOG=debug /usr/local/bin/roxy-socks
+```
+
+Or in the systemd service file:
+```
+[Service]
+Environment="RUST_LOG=debug"
+ExecStart=/usr/local/bin/roxy-socks
+```
+
 ## Testing
 
 The project includes integration tests written in Python that verify the functionality of the Roxy Docker Socket Proxy.
