@@ -23,6 +23,14 @@ impl BufferedRequest {
         Ok(Self { parts, body })
     }
 
+    /// Create a new buffered request with an empty body
+    pub fn from_parts(parts: hyper::http::request::Parts) -> Self {
+        Self { 
+            parts, 
+            body: Bytes::new() 
+        }
+    }
+
     /// Convert the buffered request back to a hyper Request
     pub fn into_request(self) -> Request<Body> {
         let body = Body::from(self.body);

@@ -7,6 +7,36 @@ rules:
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
 
+  # Allow listing containers with specific query parameters
+  - endpoint: /containers/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    match_query_params: required  # Query parameters must match the specified patterns
+    query_params:
+      limit: "^\\d+$"  # Only digits
+      all: "^(true|false)$"  # Only true or false
+
+  # Allow listing containers with optional query parameters
+  - endpoint: /containers/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    match_query_params: optional  # Query parameters must match if present, but can be missing
+    query_params:
+      limit: "^\\d+$"  # Only digits
+      all: "^(true|false)$"  # Only true or false
+
+  # Allow listing containers with regex patterns for parameter names
+  - endpoint: /containers/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    match_query_params: required  # Query parameters must match the specified patterns
+    query_params:
+      "^lim\\w+$": "^\\d+$"  # Parameter name starts with "lim", value is digits
+      "^a\\w+$": "^(true|false)$"  # Parameter name starts with "a", value is true or false
+
   # Allow inspecting containers using path variables
   - endpoint: /containers/{container_id}/json
     methods: [GET]

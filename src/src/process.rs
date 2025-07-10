@@ -1,8 +1,7 @@
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use tracing::{debug, error, trace};
+use anyhow::Result;
+use tracing::{debug, trace};
 
 // For tokio support
 use tokio::net::UnixStream as TokioUnixStream;
@@ -13,7 +12,7 @@ use procfs::process::Process;
 
 // macOS and other platforms imports
 #[cfg(not(target_os = "linux"))]
-use sysinfo::{PidExt, ProcessExt, System, SystemExt};
+use sysinfo::{ProcessExt, System, SystemExt};
 
 /// Information about a process
 #[derive(Debug, Clone)]
@@ -26,11 +25,12 @@ pub struct ProcessInfo {
 }
 
 /// Get process information for a Unix socket connection
-pub fn get_process_info(stream: &UnixStream) -> Result<ProcessInfo> {
+#[allow(dead_code)]
+pub fn get_process_info(_stream: &UnixStream) -> Result<ProcessInfo> {
     // Get the peer credentials
     #[cfg(target_os = "linux")]
     {
-        let ucred = stream
+        let ucred = _stream
             .peer_cred()
             .context("Failed to get peer credentials")?;
 

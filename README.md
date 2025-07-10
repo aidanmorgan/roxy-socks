@@ -159,6 +159,32 @@ Below are examples of different rule configurations for various use cases.
     "$[0].RepoTags": ["*"]  # Ensure images have tags
 ```
 
+#### Query Parameter Matching
+
+```yaml
+# Allow listing containers with specific query parameters
+- endpoint: /containers/json
+  methods: [GET]
+  allow: true
+  process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+  match_query_params: required  # Query parameters must match the specified patterns
+  query_params:
+    limit: "^\\d+$"  # Only digits
+    all: "^(true|false)$"  # Only true or false
+```
+
+```yaml
+# Allow listing containers with optional query parameters
+- endpoint: /containers/json
+  methods: [GET]
+  allow: true
+  process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+  match_query_params: optional  # Query parameters must match if present, but can be missing
+  query_params:
+    limit: "^\\d+$"  # Only digits
+    all: "^(true|false)$"  # Only true or false
+```
+
 #### Deny Rules
 
 ```yaml
@@ -177,6 +203,8 @@ Below are examples of different rule configurations for various use cases.
 - `process_binaries`: Process binary paths to match
 - `path_variables`: Variables to use in endpoint matching (e.g., `{container_id}`)
 - `path_regex`: Regular expression pattern for path matching
+- `match_query_params`: How to match query parameters when matching the endpoint (values: `ignore`, `required`, `optional`)
+- `query_params`: Regex patterns to match query parameters (keys are parameter names, values are regex patterns)
 
 ## Security Considerations
 
@@ -192,3 +220,42 @@ Logs are stored in the specified log directory (default: `/var/log/roxy`) and in
 - Reason for denial if applicable
 
 Logs are rotated based on the specified rotation period (default: daily) to prevent excessive disk usage.
+
+## Testing
+
+The project includes integration tests written in Python that verify the functionality of the Roxy Docker Socket Proxy.
+
+### Running Tests with CMake
+
+The tests can be run using CMake, which will build the Rust binary and then run the Python tests:
+
+```bash
+# Navigate to the test directory
+cd test
+
+# Configure CMake (only needed once)
+cmake .
+
+# Run the tests
+cmake --build . --target run-tests
+```
+
+Alternatively, you can use the make command directly:
+
+```bash
+cd test
+make run-tests
+```
+
+This will:
+1. Build the Rust binary in release mode
+2. Install the test dependencies using uv
+3. Run the pytest tests and output the results to test_output.log
+
+### Test Requirements
+
+The tests require:
+- Python 3.12 or higher
+- Docker
+- CMake 3.10 or higher
+- uv (Python package manager)

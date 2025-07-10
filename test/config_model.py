@@ -1,0 +1,70 @@
+from typing import Dict, List, Optional, Union, Any, Literal
+from pydantic import BaseModel, Field
+from enum import Enum
+import yaml
+
+
+class QueryParamMatch(str, Enum):
+    """Enum for controlling how query parameters are matched."""
+    IGNORE = "ignore"
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+
+
+# Add a custom YAML representer for the QueryParamMatch enum
+def represent_query_param_match(dumper, data):
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data.value)
+
+yaml.SafeDumper.add_representer(QueryParamMatch, represent_query_param_match)
+
+
+class Rule(BaseModel):
+    """Model for a single rule in the roxy-socks configuration."""
+    endpoint: str
+    methods: List[str]
+    allow: bool
+    process_binaries: Optional[List[str]] = None
+    path_variables: Optional[Dict[str, str]] = None
+    path_regex: Optional[str] = None
+    request_rules: Optional[Dict[str, Any]] = None
+    response_rules: Optional[Dict[str, Any]] = None
+    match_query_params: QueryParamMatch = QueryParamMatch.IGNORE
+    query_params: Optional[Dict[str, str]] = None
+
+
+class RoxyConfig(BaseModel):
+    """Model for the roxy-socks configuration file."""
+    rules: List[Rule]
+
+    def __init__(self, **data):
+        """Initialize the configuration, ensuring there's always a rule for /version endpoint."""
+        super().__init__(**data)
+
+        # Check if there's already a rule for the /version endpoint
+        has_version_rule = any(
+            rule.endpoint == "/version" and "GET" in rule.methods and rule.allow
+            for rule in self.rules
+        )
+
+        # If not, add a default rule to allow GET requests to /version
+        if not has_version_rule:
+            self.rules.append(
+                Rule(
+                    endpoint="/version",
+                    methods=["GET"],
+                    allow=True
+                )
+            )
+
+    def to_yaml(self) -> str:
+        """Convert the configuration to YAML format."""
+        import yaml
+        # Use safe_dump to avoid any potential security issues
+        return yaml.safe_dump(self.model_dump(exclude_none=True), sort_keys=False)
+
+    @classmethod
+    def from_yaml(cls, yaml_str: str) -> "RoxyConfig":
+        """Create a configuration from a YAML string."""
+        import yaml
+        data = yaml.safe_load(yaml_str)
+        return cls.model_validate(data)

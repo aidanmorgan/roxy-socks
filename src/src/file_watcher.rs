@@ -12,6 +12,7 @@ use crate::config::{self, Config};
 use crate::shared_config::SharedConfig;
 
 /// Struct to manage file watching and configuration reloading
+#[allow(dead_code)]
 pub struct ConfigWatcher {
     config_path: PathBuf,
     tx: Sender<Arc<Config>>,
@@ -20,6 +21,7 @@ pub struct ConfigWatcher {
 
 impl ConfigWatcher {
     /// Create a new ConfigWatcher
+    #[allow(dead_code)]
     pub fn new(config_path: impl AsRef<Path>) -> Self {
         let (tx, rx) = mpsc::channel(1);
         Self {
@@ -30,6 +32,7 @@ impl ConfigWatcher {
     }
 
     /// Start watching the configuration file for changes
+    #[allow(dead_code)]
     pub async fn start_watching(
         &mut self,
         initial_config: Arc<Config>,
@@ -58,6 +61,8 @@ impl ConfigWatcher {
 }
 
 /// Watch the configuration file for changes and send updated configurations
+#[allow(dead_code)]
+#[allow(unused_assignments)]
 async fn watch_config_file(
     config_path: PathBuf,
     tx: Sender<Arc<Config>>,

@@ -18,7 +18,7 @@ mod shared_config;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the socket to create
-    #[arg(short, long, default_value = "/var/run/roxy")]
+    #[arg(short, long, default_value = "/var/run/roxy.sock")]
     socket_path: PathBuf,
 
     /// Path to the Docker socket
@@ -61,6 +61,9 @@ async fn main() -> Result<()> {
 
     // Override timeout with command line argument if provided
     config.timeout = args.timeout;
+
+    // Log the configuration
+    info!("Configuration: {:?}", config);
 
     // Start the proxy server
     match proxy::start_proxy(args.socket_path, args.docker_socket, config, args.config_path.clone()).await {
