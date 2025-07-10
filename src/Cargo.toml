@@ -1,0 +1,49 @@
+[package]
+name = "roxy-socks"
+version = "0.1.0"
+edition = "2021"
+description = "A proxy for the Docker socket with configurable ACLs"
+authors = ["Aidan Morgan"]
+
+[[bin]]
+name = "roxy-socks"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { version = "0.15" }
+
+[dependencies]
+# Command line argument parsing
+clap = { version = "4.4", features = ["derive"] }
+# Configuration and rule parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+# JSON path for rule matching
+jsonpath-rust = "0.3"
+# HTTP and socket handling
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1.32", features = ["full"] }
+hyperlocal = "0.8"
+futures = "0.3"
+bytes = "1.5"
+# Process information
+sysinfo = "0.29"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+# Async utilities
+async-trait = "0.1"
+# Regular expressions for path matching
+regex = "1.9"
+# Testing utilities
+tempfile = "3.8"
+# File watching
+notify = "6.1"

@@ -1,0 +1,87 @@
+# Example configuration file for Roxy Docker Socket Proxy
+
+rules:
+  # Allow listing containers from specific binaries
+  - endpoint: /containers/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+
+  # Allow inspecting containers using path variables
+  - endpoint: /containers/{container_id}/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    path_variables:
+      container_id: ".*"  # Match any container ID
+    # Example of response_rules to ensure container is not privileged
+    response_rules:
+      "$.HostConfig.Privileged": false
+
+  # Allow accessing container logs with multiple path variables
+  - endpoint: /containers/{container_id}/logs/{log_type}
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    path_variables:
+      container_id: "[a-f0-9]+"  # Match container IDs with hexadecimal characters
+      log_type: "stdout|stderr"  # Match only stdout or stderr
+
+  # Allow inspecting containers using regex pattern
+  - endpoint: /containers/
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    path_regex: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
+
+  # Allow creating containers but restrict options
+  - endpoint: /containers/create
+    methods: [POST]
+    allow: true
+    process_binaries: ["/usr/bin/docker"]
+    # json_conditions is deprecated, use request_rules instead
+    request_rules:
+      "$.HostConfig.Privileged": false
+      "$.HostConfig.PidMode": null
+
+  # Allow starting, stopping, and removing containers
+  - endpoint: /containers/
+    methods: [POST]
+    allow: true
+    process_binaries: ["/usr/bin/docker"]
+
+  # Allow listing images
+  - endpoint: /images/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    # Example of using both request_rules and response_rules
+    # This is just an example, in practice you might not need rules for GET requests without a body
+    request_rules:
+      "$.filters.reference": null  # No specific reference filter
+    response_rules:
+      "$[0].RepoTags": ["*"]  # Ensure images have tags
+
+  # Allow pulling images
+  - endpoint: /images/create
+    methods: [POST]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+
+  # Allow inspecting images
+  - endpoint: /images/
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker"]
+
+  # Allow listing networks
+  - endpoint: /networks
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+
+  # Allow listing volumes
+  - endpoint: /volumes
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
