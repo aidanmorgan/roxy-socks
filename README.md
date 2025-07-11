@@ -62,10 +62,21 @@ roxy-socks [OPTIONS]
 - `-l, --log-dir <PATH>`: Path to the log directory (default: `/var/log/roxy`)
 - `-t, --timeout <SECONDS>`: Timeout in seconds for network operations (default: `5`)
 - `-r, --log-rotation <ROTATION>`: Log rotation duration (hourly, daily, never) (default: `daily`)
+- `--no-default-rules`: Disable the default rules that allow GET requests to the /version endpoint
 
 ## Configuration
 
 The configuration file uses YAML format and defines access control rules. By default, all requests are denied unless explicitly allowed by a rule.
+
+Roxy automatically watches the configuration file for changes and reloads the rules when the file is modified, without requiring a restart of the proxy. This allows you to update the access control rules on the fly.
+
+### Default Rules
+
+By default, Roxy adds the following rules to allow basic Docker version checking:
+- Allow GET requests to the `/version` endpoint
+- Allow GET requests to the `/v1.*/version` endpoint (using regex pattern)
+
+These default rules can be disabled using the `--no-default-rules` command-line option.
 
 ### Example Configurations
 
@@ -183,6 +194,18 @@ Below are examples of different rule configurations for various use cases.
   query_params:
     limit: "^\\d+$"  # Only digits
     all: "^(true|false)$"  # Only true or false
+```
+
+```yaml
+# Allow listing containers with regex patterns for query parameter names
+- endpoint: /containers/json
+  methods: [GET]
+  allow: true
+  process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+  match_query_params: required  # Query parameters must match the specified patterns
+  query_params:
+    "^lim\\w+$": "^\\d+$"  # Parameter names starting with "lim" must have digit values
+    "^a\\w+$": "^(true|false)$"  # Parameter names starting with "a" must be true or false
 ```
 
 #### Deny Rules
