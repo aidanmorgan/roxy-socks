@@ -124,11 +124,10 @@ Below are examples of different rule configurations for various use cases.
 
 ```yaml
 # Allow inspecting containers using regex pattern
-- endpoint: /containers/
+- endpoint: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
   methods: [GET]
   allow: true
   process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
-  path_regex: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
 ```
 
 #### Request Body Validation
@@ -225,7 +224,6 @@ Below are examples of different rule configurations for various use cases.
 - `response_rules`: JSON path conditions to match in the response body
 - `process_binaries`: Process binary paths to match
 - `path_variables`: Variables to use in endpoint matching (e.g., `{container_id}`)
-- `path_regex`: Regular expression pattern for path matching
 - `match_query_params`: How to match query parameters when matching the endpoint (values: `ignore`, `required`, `optional`)
 - `query_params`: Regex patterns to match query parameters (keys are parameter names, values are regex patterns)
 
@@ -264,6 +262,32 @@ Or in the systemd service file:
 Environment="RUST_LOG=debug"
 ExecStart=/usr/local/bin/roxy-socks
 ```
+
+## Releases
+
+The project uses GitHub Actions to automate the release process. When a new version is ready to be released, follow these steps:
+
+1. Ensure all changes are committed and pushed to the main branch
+2. Create a new tag with a version number prefixed with 'v' (e.g., `v1.0.0`)
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+3. The GitHub Actions workflow will automatically:
+   - Use GitVersion to determine the semantic version based on the tag
+   - Update the version in Cargo.toml
+   - Build the release binary
+   - Run the Rust unit tests
+   - Create a GitHub release
+   - Upload the binary as a release asset
+
+### Version Bumping
+
+You can control version bumping through commit messages using the following format:
+- `+semver: major` or `+semver: breaking` - Bump major version
+- `+semver: minor` or `+semver: feature` - Bump minor version
+- `+semver: patch` or `+semver: fix` - Bump patch version
+- `+semver: none` or `+semver: skip` - Don't bump version
 
 ## Testing
 

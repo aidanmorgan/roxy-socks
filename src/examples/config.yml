@@ -58,11 +58,10 @@ rules:
       log_type: "stdout|stderr"  # Match only stdout or stderr
 
   # Allow inspecting containers using regex pattern
-  - endpoint: /containers/
+  - endpoint: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
     methods: [GET]
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
-    path_regex: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
 
   # Allow creating containers but restrict options
   - endpoint: /containers/create

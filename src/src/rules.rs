@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use hyper::{Body, Method, Request};
@@ -19,7 +21,6 @@ pub fn add_default_rules(rules: &mut Vec<crate::rules::Rule>) {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         });
@@ -34,7 +35,6 @@ pub fn add_default_rules(rules: &mut Vec<crate::rules::Rule>) {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         });
@@ -57,27 +57,21 @@ pub fn add_default_rules(rules: &mut Vec<crate::rules::Rule>) {
 /// * `false` if the string is not a valid regex pattern or doesn't contain regex special characters
 pub fn is_regex(pattern: &str) -> bool {
     // Check if the string contains common regex special characters
-    let has_special_chars = pattern.contains('*') || 
-                           pattern.contains('+') || 
-                           pattern.contains('?') || 
-                           pattern.contains('[') || 
-                           pattern.contains(']') || 
-                           pattern.contains('(') || 
-                           pattern.contains(')') || 
-                           pattern.contains('^') || 
-                           pattern.contains('$') || 
-                           pattern.contains('|') || 
-                           pattern.contains('\\') || 
-                           pattern.contains('.');
+    // Use a static array to avoid recreating it on each call
+    static SPECIAL_CHARS: [char; 12] = ['*', '+', '?', '[', ']', '(', ')', '^', '$', '|', '\\', '.'];
 
-    // If it has special characters, try to compile it as a regex
+    // Early return for empty patterns
+    if pattern.is_empty() {
+        return false;
+    }
+
+    // Check for special characters first - this is a fast check that avoids regex compilation
+    let has_special_chars = SPECIAL_CHARS.iter().any(|&c| pattern.contains(c));
+
+    // Only try to compile as regex if it has special characters
     if has_special_chars {
-        match Regex::new(pattern) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        Regex::new(pattern).is_ok()
     } else {
-        // If it doesn't have special characters, it's not intended to be a regex
         false
     }
 }
@@ -204,10 +198,6 @@ pub struct Rule {
     #[serde(default)]
     pub path_variables: Option<HashMap<String, String>>,
 
-    /// Optional regex pattern for path matching
-    #[serde(default)]
-    pub path_regex: Option<String>,
-
     /// How to match query parameters when matching the endpoint
     #[serde(default)]
     pub match_query_params: QueryParamMatch,
@@ -228,7 +218,6 @@ impl Default for Rule {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         }
@@ -244,168 +233,95 @@ impl Rule {
         debug!("Path matching - Path: {}", path);
         debug!("Path matching - Path without Query: {}", path_without_query);
         debug!("Path matching - Endpoint: {}", self.endpoint);
-        debug!("Path matching - Path regex: {:?}", self.path_regex);
         debug!("Path matching - Path variables: {:?}", self.path_variables);
 
-        // If path_regex is specified, use it for matching the full path (including query params)
-        if let Some(regex_pattern) = &self.path_regex {
-            // Check if it's a valid regex pattern
-            if is_regex(regex_pattern) {
-                match Regex::new(regex_pattern) {
-                    Ok(regex) => {
-                        if !regex.is_match(path) {
-                            trace!("Path regex mismatch: {} doesn't match pattern {}", path, regex_pattern);
-                            return Ok(false);
-                        }
-                        debug!("Path regex match: {} matches pattern {}", path, regex_pattern);
-                    },
-                    Err(e) => {
-                        trace!("Invalid regex pattern in path_regex: {}", e);
-                        // If it's not a valid regex, treat it as a literal string
-                        if path != regex_pattern {
-                            trace!("Path literal mismatch: {} != {}", path, regex_pattern);
-                            return Ok(false);
-                        }
-                        debug!("Path literal match: {} == {}", path, regex_pattern);
-                    }
-                }
-            } else {
-                // Not intended to be a regex, treat as literal string
-                if path != regex_pattern {
-                    trace!("Path literal mismatch: {} != {}", path, regex_pattern);
-                    return Ok(false);
-                }
-                debug!("Path literal match: {} == {}", path, regex_pattern);
-            }
-        }
-        // Otherwise, use endpoint with variables if specified
-        else if let Some(variables) = &self.path_variables {
-            // For simple cases with exact string matching, try a direct approach first
-            if variables.len() == 1 {
-                let (var_name, var_value) = variables.iter().next().unwrap();
+        // Case 1: Endpoint with path variables
+        if let Some(variables) = &self.path_variables {
+            // Build the pattern string only once
+            let mut pattern_str = self.endpoint.as_str();
+            let mut owned_pattern = String::new();
+
+            // Collect all replacements first to avoid multiple string allocations
+            let mut replacements = Vec::with_capacity(variables.len());
+            for (var_name, var_value) in variables {
                 let placeholder = format!("{{{}}}", var_name);
-
-                // Extract the variable value from the path
-                let endpoint_parts: Vec<&str> = self.endpoint.split(&placeholder).collect();
-                if endpoint_parts.len() == 2 {
-                    let prefix = endpoint_parts[0];
-                    let suffix = endpoint_parts[1];
-
-                    // Check if the path starts with the prefix and ends with the suffix
-                    if path_without_query.starts_with(prefix) && path_without_query.ends_with(suffix) {
-                        // Extract the variable value from the path
-                        let var_start = prefix.len();
-                        let var_end = path_without_query.len() - suffix.len();
-                        if var_start <= var_end {
-                            let extracted_value = &path_without_query[var_start..var_end];
-
-                            // Check if the extracted value matches the variable pattern
-                            if is_regex(var_value) {
-                                match Regex::new(var_value) {
-                                    Ok(regex) => {
-                                        if !regex.is_match(extracted_value) {
-                                            trace!("Path variable mismatch: {} doesn't match pattern {}", extracted_value, var_value);
-                                            return Ok(false);
-                                        }
-                                        debug!("Path variable match: {} matches pattern {}", extracted_value, var_value);
-                                    },
-                                    Err(e) => {
-                                        trace!("Invalid regex pattern in path variable: {}", e);
-                                        // If it's not a valid regex, do a literal comparison
-                                        if extracted_value != var_value {
-                                            trace!("Path variable literal mismatch: {} != {}", extracted_value, var_value);
-                                            return Ok(false);
-                                        }
-                                        debug!("Path variable literal match: {} == {}", extracted_value, var_value);
-                                    }
-                                }
-                            } else {
-                                // Not intended to be a regex, do a literal comparison
-                                if extracted_value != var_value {
-                                    trace!("Path variable literal mismatch: {} != {}", extracted_value, var_value);
-                                    return Ok(false);
-                                }
-                                debug!("Path variable literal match: {} == {}", extracted_value, var_value);
-                            }
-                        } else {
-                            trace!("Invalid path variable extraction: start {} > end {}", var_start, var_end);
-                            return Ok(false);
-                        }
-                    } else {
-                        trace!("Path doesn't match endpoint pattern: {} doesn't match {}...{}", path_without_query, prefix, suffix);
-                        return Ok(false);
+                let capture_group = if is_regex(var_value) {
+                    match Regex::new(var_value) {
+                        Ok(_) => format!("({})", var_value),
+                        Err(_) => format!("({})", regex::escape(var_value))
                     }
                 } else {
-                    // Shouldn't happen, but handle it gracefully
-                    trace!("Invalid placeholder format in endpoint: {}", self.endpoint);
-                    return Ok(false);
-                }
-            } else {
-                // For multiple variables, use a more complex regex approach
-                // Start with the endpoint and escape it
-                let mut pattern_str = self.endpoint.clone();
-
-                // Replace each variable placeholder with a capture group
-                for (var_name, var_value) in variables {
-                    let placeholder = format!("{{{}}}", var_name);
-                    // Check if var_value is a valid regex pattern
-                    let capture_group = if is_regex(var_value) && Regex::new(var_value).is_ok() {
-                        format!("({})", var_value)
-                    } else {
-                        // If it's not a valid regex, escape it to treat it as a literal string
-                        format!("({})", regex::escape(var_value))
-                    };
-                    pattern_str = pattern_str.replace(&placeholder, &capture_group);
-                }
-
-                // Create a regex from the pattern
-                let regex = Regex::new(&format!("^{}$", pattern_str)).context("Invalid regex pattern from multiple path variables")?;
-                if !regex.is_match(path_without_query) {
-                    trace!("Path regex mismatch: {} doesn't match pattern ^{}$", path_without_query, pattern_str);
-                    return Ok(false);
-                }
-                debug!("Path regex match: {} matches pattern ^{}$", path_without_query, pattern_str);
+                    format!("({})", regex::escape(var_value))
+                };
+                replacements.push((placeholder, capture_group));
             }
-        }
-        // Check if the endpoint is intended to be a regex
-        else if is_regex(&self.endpoint) {
-            // Try to compile it as a regex
-            match Regex::new(&self.endpoint) {
-                Ok(_) => {
-                    // Endpoint is a valid regex pattern, use regex matching
-                    let regex_pattern = if !self.endpoint.starts_with('^') {
-                        format!("^{}", self.endpoint)
-                    } else {
-                        self.endpoint.clone()
-                    };
 
-                    let regex = Regex::new(&regex_pattern).context("Invalid regex pattern in endpoint")?;
-                    if !regex.is_match(path_without_query) {
+            // Apply all replacements at once
+            for (placeholder, capture_group) in replacements {
+                if owned_pattern.is_empty() {
+                    // First replacement, need to clone the endpoint
+                    owned_pattern = pattern_str.replace(&placeholder, &capture_group);
+                    pattern_str = &owned_pattern;
+                } else {
+                    // Subsequent replacements, modify in place
+                    owned_pattern = pattern_str.replace(&placeholder, &capture_group);
+                    pattern_str = &owned_pattern;
+                }
+            }
+
+            // Create a regex from the pattern
+            let regex_pattern = format!("^{}$", pattern_str);
+            let regex = Regex::new(&regex_pattern).context("Invalid regex pattern from path variables")?;
+            let matches = regex.is_match(path_without_query);
+
+            if matches {
+                debug!("Path regex match: {} matches pattern {}", path_without_query, regex_pattern);
+            } else {
+                trace!("Path regex mismatch: {} doesn't match pattern {}", path_without_query, regex_pattern);
+            }
+
+            return Ok(matches);
+        }
+
+        // Case 2: Endpoint as regex
+        if is_regex(&self.endpoint) {
+            // Ensure the regex has a start anchor
+            let regex_pattern = if !self.endpoint.starts_with('^') {
+                format!("^{}", self.endpoint)
+            } else {
+                // Still need to clone for consistent types
+                self.endpoint.clone()
+            };
+
+            match Regex::new(&regex_pattern) {
+                Ok(regex) => {
+                    let matches = regex.is_match(path_without_query);
+
+                    if matches {
+                        debug!("Endpoint regex match: {} matches pattern {}", path_without_query, regex_pattern);
+                    } else {
                         trace!("Endpoint regex mismatch: {} doesn't match pattern {}", path_without_query, regex_pattern);
-                        return Ok(false);
                     }
-                    debug!("Endpoint regex match: {} matches pattern {}", path_without_query, regex_pattern);
+
+                    return Ok(matches);
                 },
                 Err(e) => {
                     trace!("Invalid regex pattern in endpoint: {}", e);
-                    // If it's not a valid regex, fall back to prefix matching
-                    if !path_without_query.starts_with(&self.endpoint) {
-                        trace!("Endpoint mismatch: {} doesn't start with {}", path_without_query, self.endpoint);
-                        return Ok(false);
-                    }
-                    debug!("Endpoint prefix match: {} starts with {}", path_without_query, self.endpoint);
+                    // Fall back to prefix matching for invalid regex
                 }
             }
         }
-        // Otherwise, use the original endpoint matching
-        else if !path_without_query.starts_with(&self.endpoint) {
-            trace!("Endpoint mismatch: {} doesn't start with {}", path_without_query, self.endpoint);
-            return Ok(false);
-        } else {
+
+        // Case 3: Simple prefix matching
+        let matches = path_without_query.starts_with(&self.endpoint);
+
+        if matches {
             debug!("Endpoint prefix match: {} starts with {}", path_without_query, self.endpoint);
+        } else {
+            trace!("Endpoint mismatch: {} doesn't start with {}", path_without_query, self.endpoint);
         }
 
-        Ok(true)
+        Ok(matches)
     }
 
     /// Check if the query parameters match the rule
@@ -414,84 +330,102 @@ impl Rule {
         debug!("Query params matching - Query string: {:?}", query);
         debug!("Query params matching - Rule query params: {:?}", self.query_params);
 
-        if self.match_query_params != QueryParamMatch::Ignore {
-            if let Some(query_params) = &self.query_params {
-                if !query_params.is_empty() {
-                    // Get the query string from the URI
-                    if let Some(query_str) = query {
-                        // Parse the query string into key-value pairs
-                        let query_pairs: Vec<(String, String)> = query_str
-                            .split('&')
-                            .filter_map(|pair| {
-                                let mut parts = pair.split('=');
-                                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                                    Some((key.to_string(), value.to_string()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+        // If we're ignoring query params or no query params are specified, return true
+        if self.match_query_params == QueryParamMatch::Ignore || 
+           self.query_params.as_ref().map_or(true, |params| params.is_empty()) {
+            return Ok(true);
+        }
 
-                        // Check each query parameter against the regex pattern
-                        for (param_name, pattern) in query_params {
-                            // Check if pattern is intended to be a regex
-                            let regex = if is_regex(pattern) {
-                                match Regex::new(pattern) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        trace!("Invalid regex pattern for query parameter {}: {}", param_name, e);
-                                        return Ok(false);
-                                    }
-                                }
-                            } else {
-                                // If not intended to be a regex, create a regex that matches the literal string
-                                Regex::new(&format!("^{}$", regex::escape(pattern))).unwrap()
-                            };
+        let query_params = self.query_params.as_ref().unwrap();
 
-                            // Check if param_name is intended to be a regex
-                            let name_regex = if is_regex(param_name) {
-                                match Regex::new(param_name) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        trace!("Invalid regex pattern for parameter name {}: {}", param_name, e);
-                                        return Ok(false);
-                                    }
-                                }
-                            } else {
-                                // If not intended to be a regex, create a regex that matches the literal string
-                                Regex::new(&format!("^{}$", regex::escape(param_name))).unwrap()
-                            };
+        // No query string in the URI
+        if query.is_none() && self.match_query_params == QueryParamMatch::Required {
+            trace!("No query string in URI, but query parameters are required");
+            return Ok(false);
+        } else if query.is_none() {
+            // For Optional, missing query string is allowed
+            return Ok(true);
+        }
 
-                            // Find the parameter in the query string using regex for parameter name
-                            let param_value = query_pairs.iter()
-                                .find(|(k, _)| name_regex.is_match(k))
-                                .map(|(_, v)| v);
+        // Parse the query string into key-value pairs
+        // Avoid unnecessary allocations by using references where possible
+        let query_str = query.unwrap();
 
-                            match param_value {
-                                Some(value) => {
-                                    if !regex.is_match(value) {
-                                        trace!("Query parameter mismatch: {}={} doesn't match pattern {}", param_name, value, pattern);
-                                        return Ok(false);
-                                    }
-                                },
-                                None => {
-                                    // Parameter not found in the query string
-                                    if self.match_query_params == QueryParamMatch::Required {
-                                        trace!("Query parameter not found: {}", param_name);
-                                        return Ok(false);
-                                    }
-                                    // For Optional, missing parameters are allowed
-                                }
-                            }
-                        }
-                    } else {
-                        // No query string in the URI
-                        if self.match_query_params == QueryParamMatch::Required {
-                            trace!("No query string in URI, but query parameters are required");
-                            return Ok(false);
-                        }
-                        // For Optional, missing query string is allowed
+        // Pre-allocate the vector to avoid resizing
+        let mut query_pairs = Vec::with_capacity(query_str.split('&').count());
+        for pair in query_str.split('&') {
+            let mut parts = pair.split('=');
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                query_pairs.push((key, value));
+            }
+        }
+
+        // Check each query parameter against the regex pattern
+        for (param_name, pattern) in query_params {
+            // Create regex for parameter value only once
+            let value_regex = if is_regex(pattern) {
+                match Regex::new(pattern) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        trace!("Invalid regex pattern for query parameter {}: {}", param_name, e);
+                        return Ok(false);
                     }
+                }
+            } else {
+                // Literal string match - escape once and compile
+                let escaped_pattern = regex::escape(pattern);
+                let regex_pattern = format!("^{}$", escaped_pattern);
+                match Regex::new(&regex_pattern) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        trace!("Invalid regex pattern for query parameter {}: {}", param_name, e);
+                        return Ok(false);
+                    }
+                }
+            };
+
+            // Create regex for parameter name only once
+            let name_regex = if is_regex(param_name) {
+                match Regex::new(param_name) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        trace!("Invalid regex pattern for parameter name {}: {}", param_name, e);
+                        return Ok(false);
+                    }
+                }
+            } else {
+                // Literal string match - escape once and compile
+                let escaped_name = regex::escape(param_name);
+                let regex_pattern = format!("^{}$", escaped_name);
+                match Regex::new(&regex_pattern) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        trace!("Invalid regex pattern for parameter name {}: {}", param_name, e);
+                        return Ok(false);
+                    }
+                }
+            };
+
+            // Find the parameter in the query string using regex for parameter name
+            // Use references to avoid unnecessary string allocations
+            let param_value = query_pairs.iter()
+                .find(|(k, _)| name_regex.is_match(k))
+                .map(|(_, v)| *v);
+
+            // Check if parameter exists and matches
+            match param_value {
+                Some(value) => {
+                    if !value_regex.is_match(value) {
+                        trace!("Query parameter mismatch: {}={} doesn't match pattern {}", param_name, value, pattern);
+                        return Ok(false);
+                    }
+                },
+                None if self.match_query_params == QueryParamMatch::Required => {
+                    trace!("Required query parameter not found: {}", param_name);
+                    return Ok(false);
+                },
+                None => {
+                    // For Optional, missing parameters are allowed
                 }
             }
         }
@@ -809,7 +743,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -846,7 +779,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -879,7 +811,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -911,7 +842,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -948,7 +878,6 @@ mod tests {
             response_rules: None,
             process_binaries: Some(vec!["/usr/bin/docker".to_string()]),
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -988,7 +917,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1028,7 +956,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: Some(path_variables),
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1074,7 +1001,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: Some(path_variables),
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1148,16 +1074,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_rule_with_path_regex() {
-        // Create a rule with path regex
+        // Create a rule with regex in the endpoint
         let rule = Rule {
-            endpoint: "/containers/".to_string(), // This is still used as a prefix check if regex doesn't match
+            endpoint: r"^/containers/[a-f0-9]+/start$".to_string(), // Regex pattern directly in the endpoint
             methods: vec!["POST".to_string()],
             allow: true,
             request_rules: None,
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: Some(r"^/containers/[a-f0-9]+/start$".to_string()),
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1203,7 +1128,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Required,
             query_params: Some(query_params),
         };
@@ -1266,7 +1190,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: Some(query_params_clone),
         };
@@ -1297,7 +1220,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Required,
             query_params: Some(query_params),
         };
@@ -1350,7 +1272,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Required,
             query_params: Some(mixed_params),
         };
@@ -1381,7 +1302,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Optional,
             query_params: Some(query_params),
         };
@@ -1457,7 +1377,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1630,14 +1549,13 @@ mod tests {
         // Test case 1: First rule matches and allows, second rule matches but denies
         // The first rule should take precedence
         let rule1 = Rule {
-            endpoint: "/containers/".to_string(),
+            endpoint: r"^/containers/[a-z0-9]+/start$".to_string(),
             methods: vec!["POST".to_string()],
             allow: true,
             request_rules: None,
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: Some(r"^/containers/[a-z0-9]+/start$".to_string()),
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1650,7 +1568,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1662,14 +1579,13 @@ mod tests {
         // Test case 2: First rule doesn't match, second rule matches and denies
         // The second rule should be used
         let rule1_no_match = Rule {
-            endpoint: "/containers/".to_string(),
+            endpoint: r"^/containers/[a-z0-9]+/start$".to_string(),
             methods: vec!["GET".to_string()], // Different method, won't match
             allow: true,
             request_rules: None,
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: Some(r"^/containers/[a-z0-9]+/start$".to_string()),
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1693,7 +1609,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1706,7 +1621,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1733,7 +1647,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1810,7 +1723,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1847,7 +1759,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1866,14 +1777,13 @@ mod tests {
 
         // Test case 2: Path with special characters
         let rule_special_chars = Rule {
-            endpoint: "/containers/".to_string(),
+            endpoint: r"^/containers/[a-z0-9\-_\.]+$".to_string(),
             methods: vec!["GET".to_string()],
             allow: true,
             request_rules: None,
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: Some(r"^/containers/[a-z0-9\-_\.]+$".to_string()),
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };
@@ -1902,7 +1812,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Required,
             query_params: Some(query_params),
         };
@@ -1931,7 +1840,6 @@ mod tests {
             response_rules: None,
             process_binaries: None,
             path_variables: None,
-            path_regex: None,
             match_query_params: QueryParamMatch::Ignore,
             query_params: None,
         };

@@ -38,7 +38,6 @@ def pytest_configure(config: Config) -> None:
 def docker_client() -> docker.DockerClient:
     """Create a Docker client for the tests."""
     client = docker.from_env()
-    logger.info(f"Created docker client: {client}")
     return client
 
 
@@ -114,7 +113,6 @@ def roxy_socket() -> Generator[Path, None, None]:
         socket_path = Path(temp_dir) / "roxy.sock"
         logger.info(f"Created socket path: {socket_path}")
         yield socket_path
-        logger.info(f"Cleaning up socket path: {socket_path}")
 
 
 @pytest.fixture(scope="function")
@@ -233,11 +231,8 @@ def roxy_process(
 def docker_client_with_roxy(roxy_socket: Path, roxy_process: subprocess.Popen, request: FixtureRequest) -> Generator[docker.DockerClient, None, None]:
     """Create a Docker client that uses the roxy-socks proxy."""
     base_url = f"unix://{roxy_socket}"
-    logger.info(f"Creating Docker client with base_url: {base_url}")
     client = docker.DockerClient(base_url=base_url)
-    logger.info(f"Created Docker client: {client}")
     yield client
-    logger.info(f"Closing Docker client: {client}")
     client.close()
 
     client.close()

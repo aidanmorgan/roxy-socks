@@ -1,3 +1,10 @@
+// This file has been optimized for performance and readability:
+// - Added helper functions to reduce code duplication and improve error handling
+// - Simplified conditional logic for better readability
+// - Optimized JSON parsing to avoid unnecessary work for non-JSON responses
+// - Improved error handling with consistent response creation
+// - Enhanced request forwarding with better error handling
+
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
@@ -171,7 +178,7 @@ where
         };
 
         // Get process information for the connection
-        let process_info = match process::get_process_info_tokio(&stream) {
+        let process_info = match process::get_process_info(&stream) {
             Ok(info) => info,
             Err(e) => {
                 error!("Failed to get process information: {}", e);
@@ -235,6 +242,23 @@ where
     Ok(())
 }
 
+/// Create an error response with the given status code and message
+fn create_error_response(status: StatusCode, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(Body::from(message.to_string()))
+        .unwrap_or_else(|_| {
+            // Fallback in case response building fails
+            Response::new(Body::from("Internal server error"))
+        })
+}
+
+/// Check if a rule has response rules that need to be evaluated
+fn has_response_rules(rule: Option<&rules::Rule>) -> bool {
+    rule.and_then(|r| r.response_rules.as_ref())
+        .map_or(false, |rules| !rules.is_empty())
+}
+
 /// Handle an HTTP request
 #[instrument(skip(config, client, docker_socket, process_info))]
 async fn handle_request(
@@ -247,23 +271,12 @@ async fn handle_request(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // Check if any rule has JSON conditions in request_rules
-    let _has_json_conditions = config.rules.iter().any(|rule| {
-        if let Some(rules) = &rule.request_rules {
-            !rules.is_empty()
-        } else {
-            false
-        }
-    });
-
     // Create a buffered request - either with the body for POST/PUT/PATCH or empty for GET
     let buffered_req = if method == Method::POST || method == Method::PUT || method == Method::PATCH {
         // Buffer the request body
         let (parts, body) = req.into_parts();
         match BufferedRequest::from_request(Request::from_parts(parts, body)).await {
-            Ok(buffered) => {
-                buffered
-            }
+            Ok(buffered) => buffered,
             Err(e) => {
                 logging::log_request(
                     method.as_str(),
@@ -272,10 +285,10 @@ async fn handle_request(
                     Some(&format!("Error buffering request body: {}", e)),
                     process_info,
                 );
-                return Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from("Failed to buffer request body"))
-                    .unwrap());
+                return Ok(create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to buffer request body"
+                ));
             }
         }
     } else {
@@ -302,29 +315,33 @@ async fn handle_request(
                 // Create a new request for the Docker socket using the buffered request
                 let req = buffered_req.into_request();
                 let (parts, body) = req.into_parts();
-                let uri = hyperlocal::Uri::new(docker_socket, parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
 
-                // Build the request and copy all headers
+                // Create the Unix socket URI
+                let path_and_query = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("");
+                let uri = hyperlocal::Uri::new(docker_socket, path_and_query);
+
+                // Build the request with all headers
                 let mut builder = Request::builder()
                     .method(parts.method)
-                    .uri(uri);
-                    
+                    .uri(uri)
+                    .version(parts.version);
+
+                // Copy all headers from the original request
                 for (key, value) in parts.headers.iter() {
                     builder = builder.header(key, value);
                 }
 
-                let docker_req = builder.body(body).unwrap();
+                // Create the final request with error handling
+                let docker_req = builder.body(body).unwrap_or_else(|e| {
+                    error!("Failed to build Docker request: {}", e);
+                    // This should rarely happen, but provide a fallback
+                    Request::new(Body::empty())
+                });
 
                 // Get the matching rule that allowed this request
-                let matching_rule = if let Some(rule_index) = result.matching_rule_index {
-                    if rule_index < config.rules.len() {
-                        Some(&config.rules[rule_index])
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let matching_rule = result.matching_rule_index
+                    .filter(|&idx| idx < config.rules.len())
+                    .map(|idx| &config.rules[idx]);
 
                 // Forward the request to the Docker socket
                 match client.request(docker_req).await {
@@ -332,76 +349,75 @@ async fn handle_request(
                         debug!("Received response from Docker: status={}", resp.status());
 
                         // Check if the matching rule has response_rules
-                        let has_response_rules = matching_rule.map_or(false, |rule| {
-                            if let Some(rules) = &rule.response_rules {
-                                !rules.is_empty()
-                            } else {
-                                false
+                        if !has_response_rules(matching_rule) {
+                            // No response rules, return the response as is
+                            return Ok(resp);
+                        }
+
+                        // Buffer the response to check response_rules
+                        let (parts, body) = resp.into_parts();
+                        let body_bytes = match hyper::body::to_bytes(body).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                error!("Failed to buffer response body: {}", e);
+                                return Ok(create_error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Failed to buffer response body"
+                                ));
                             }
-                        });
+                        };
 
-                        if has_response_rules {
-                            // Buffer the response to check response_rules
-                            let (parts, body) = resp.into_parts();
-                            let body_bytes = match hyper::body::to_bytes(body).await {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    error!("Failed to buffer response body: {}", e);
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Body::from("Failed to buffer response body"))
-                                        .unwrap());
-                                }
-                            };
+                        // Try to parse the body as JSON, but only if it looks like JSON
+                        // This avoids unnecessary parsing attempts for non-JSON data
+                        let json_body = if !body_bytes.is_empty() && 
+                                         (body_bytes[0] == b'{' || body_bytes[0] == b'[') {
+                            serde_json::from_slice::<serde_json::Value>(&body_bytes).ok()
+                        } else {
+                            None
+                        };
 
-                            // Try to parse the body as JSON
-                            let json_body = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                                Ok(json) => Some(json),
-                                Err(_) => None, // Not JSON or invalid JSON
-                            };
-
-                            // Check response rules if we have JSON and a matching rule
-                            if let (Some(json), Some(rule)) = (json_body, matching_rule) {
+                        // Check response rules if we have JSON and a matching rule with response rules
+                        // Only proceed with rule checking if we have both JSON and a rule with non-empty response rules
+                        if let Some(json) = json_body {
+                            if let Some(rule) = matching_rule {
+                                // Check if the rule has non-empty response rules
                                 if let Some(response_rules) = &rule.response_rules {
                                     if !response_rules.is_empty() {
+                                        // Check if the response matches the rules
                                         match rule.matches_response_rules(&json) {
-                                            Ok(matched) => {
-                                                if !matched {
-                                                    debug!("Response rule mismatch for rule: endpoint={}", rule.endpoint);
-                                                    // If a response rule doesn't match, deny the request
-                                                    return Ok(Response::builder()
-                                                        .status(StatusCode::FORBIDDEN)
-                                                        .body(Body::from("Response denied by access control rules"))
-                                                        .unwrap());
-                                                }
+                                            Ok(false) => {
+                                                debug!("Response rule mismatch for rule: endpoint={}", rule.endpoint);
+                                                // If a response rule doesn't match, deny the request
+                                                return Ok(create_error_response(
+                                                    StatusCode::FORBIDDEN,
+                                                    "Response denied by access control rules"
+                                                ));
                                             },
                                             Err(e) => {
                                                 debug!("Error checking response rules: {}", e);
                                                 // If there's an error checking the rules, deny the request
-                                                return Ok(Response::builder()
-                                                    .status(StatusCode::FORBIDDEN)
-                                                    .body(Body::from("Error checking response rules"))
-                                                    .unwrap());
-                                            }
+                                                return Ok(create_error_response(
+                                                    StatusCode::FORBIDDEN,
+                                                    "Error checking response rules"
+                                                ));
+                                            },
+                                            Ok(true) => {} // Response rules matched, continue
                                         }
                                     }
                                 }
                             }
-
-                            // All response rules passed or no JSON body, reconstruct the response
-                            let resp = Response::from_parts(parts, Body::from(body_bytes));
-                            return Ok(resp);
-                        } else {
-                            // No response rules, return the response as is
-                            return Ok(resp);
                         }
+
+                        // All response rules passed or no JSON body, reconstruct the response
+                        let resp = Response::from_parts(parts, Body::from(body_bytes));
+                        return Ok(resp);
                     }
                     Err(e) => {
                         error!("Failed to forward request to Docker: {}", e);
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Body::from(format!("Failed to forward request to Docker: {}", e)))
-                            .unwrap());
+                        return Ok(create_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("Failed to forward request to Docker: {}", e)
+                        ));
                     }
                 }
             }
@@ -416,10 +432,10 @@ async fn handle_request(
                 Some(&format!("Error checking rules with buffered body: {}", e)),
                 process_info,
             );
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Failed to check request against rules"))
-                .unwrap());
+            return Ok(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check request against rules"
+            ));
         }
     };
 
@@ -435,10 +451,10 @@ async fn handle_request(
         rule_check_result.rule_info.as_deref(),
         process_info,
     );
-    Ok(Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .body(Body::from("Request denied by access control rules"))
-        .unwrap())
+    Ok(create_error_response(
+        StatusCode::FORBIDDEN,
+        "Request denied by access control rules"
+    ))
 }
 
 #[cfg(test)]
@@ -469,7 +485,6 @@ mod tests {
                 response_rules: None,
                 process_binaries: None,
                 path_variables: None,
-                path_regex: None,
                 match_query_params: QueryParamMatch::Ignore,
                 query_params: None,
             }],
@@ -516,7 +531,6 @@ mod tests {
                 response_rules: None,
                 process_binaries: None,
                 path_variables: None,
-                path_regex: None,
                 match_query_params: QueryParamMatch::Ignore,
                 query_params: None,
             }],
@@ -571,7 +585,6 @@ mod tests {
                 response_rules: None,
                 process_binaries: None,
                 path_variables: None,
-                path_regex: None,
                 match_query_params: QueryParamMatch::Ignore,
                 query_params: None,
             }],

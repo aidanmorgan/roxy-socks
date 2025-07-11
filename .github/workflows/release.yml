@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Required for GitVersion to work properly
+      
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v0.9.15
+        with:
+          versionSpec: '5.x'
+      
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v0.9.15
+        with:
+          useConfigFile: true
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      
+      - name: Update Cargo.toml version
+        run: |
+          cd src
+          sed -i "s/^version = \".*\"/version = \"${{ steps.gitversion.outputs.semVer }}\"/" Cargo.toml
+          cat Cargo.toml
+      
+      - name: Build Release
+        run: |
+          cd src
+          cargo build --release
+      
+      - name: Run Tests
+        run: |
+          cd src
+          cargo test --release
+      
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ steps.gitversion.outputs.semVer }}
+          draft: false
+          prerelease: false
+      
+      - name: Package Binary
+        run: |
+          cd src/target/release
+          tar -czf roxy-socks-${{ steps.gitversion.outputs.semVer }}-linux-x86_64.tar.gz roxy-socks
+      
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./src/target/release/roxy-socks-${{ steps.gitversion.outputs.semVer }}-linux-x86_64.tar.gz
+          asset_name: roxy-socks-${{ steps.gitversion.outputs.semVer }}-linux-x86_64.tar.gz
+          asset_content_type: application/gzip

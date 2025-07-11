@@ -25,7 +25,6 @@ class Rule(BaseModel):
     allow: bool = True
     process_binaries: Optional[List[str]] = None
     path_variables: Optional[Dict[str, str]] = None
-    path_regex: Optional[str] = None
     request_rules: Optional[Dict[str, Any]] = None
     response_rules: Optional[Dict[str, Any]] = None
     match_query_params: QueryParamMatch = QueryParamMatch.IGNORE

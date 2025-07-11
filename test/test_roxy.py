@@ -408,12 +408,11 @@ class TestRoxyIntegration:
         """Test rules with path_regex including query parameters."""
         # Create the model and configure roxy
         with_roxy_config(RoxyConfig(rules=[
-            # List containers rule with path_regex for specific query parameters
+            # List containers rule with regex endpoint for specific query parameters
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="^/v1\\.[0-9]+/containers/json\\?all=true&limit=\\d+$",  # Only allow with all=true and limit=<number>
                 methods=["GET"],
-                allow=True,
-                path_regex="^/v1\\.[0-9]+/containers/json\\?all=true&limit=\\d+$"  # Only allow with all=true and limit=<number>
+                allow=True
             ),
             # Create container rule
             Rule(
@@ -856,12 +855,11 @@ class TestRoxyNegative:
         """Test that path_regex works correctly for complex paths."""
         # Create the model and configure roxy with path_regex
         with_roxy_config(RoxyConfig(rules=[
-            # Rule with path_regex
+            # Rule with regex endpoint
             Rule(
-                endpoint="/v1.*/containers/json",
+                endpoint="^/v1\\.[0-9]+/containers/json\\?all=true$",  # Only allow with all=true query param
                 methods=["GET"],
-                allow=True,
-                path_regex="^/v1\\.[0-9]+/containers/json\\?all=true$"  # Only allow with all=true query param
+                allow=True
             )
         ]))
 
