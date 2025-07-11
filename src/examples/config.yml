@@ -1,13 +1,17 @@
 # Example configuration file for Roxy Docker Socket Proxy
+# This file demonstrates various rule types and options available in Roxy
 
 rules:
+  # ===== Basic Endpoint and Method Matching =====
   # Allow listing containers from specific binaries
   - endpoint: /containers/json
     methods: [GET]
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
 
-  # Allow listing containers with specific query parameters
+  # ===== Query Parameter Matching =====
+  # Example 1: Required query parameters
+  # Allow listing containers with specific query parameters that must be present
   - endpoint: /containers/json
     methods: [GET]
     allow: true
@@ -17,6 +21,7 @@ rules:
       limit: "^\\d+$"  # Only digits
       all: "^(true|false)$"  # Only true or false
 
+  # Example 2: Optional query parameters
   # Allow listing containers with optional query parameters
   - endpoint: /containers/json
     methods: [GET]
@@ -27,6 +32,15 @@ rules:
       limit: "^\\d+$"  # Only digits
       all: "^(true|false)$"  # Only true or false
 
+  # Example 3: Ignore query parameters
+  # Allow listing containers regardless of query parameters
+  - endpoint: /containers/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+    match_query_params: ignore  # Query parameters are completely ignored when matching this rule
+
+  # Example 4: Regex patterns for parameter names
   # Allow listing containers with regex patterns for parameter names
   - endpoint: /containers/json
     methods: [GET]
@@ -37,6 +51,8 @@ rules:
       "^lim\\w+$": "^\\d+$"  # Parameter name starts with "lim", value is digits
       "^a\\w+$": "^(true|false)$"  # Parameter name starts with "a", value is true or false
 
+  # ===== Path Variables =====
+  # Example 1: Single path variable
   # Allow inspecting containers using path variables
   - endpoint: /containers/{container_id}/json
     methods: [GET]
@@ -48,6 +64,7 @@ rules:
     response_rules:
       "$.HostConfig.Privileged": false
 
+  # Example 2: Multiple path variables
   # Allow accessing container logs with multiple path variables
   - endpoint: /containers/{container_id}/logs/{log_type}
     methods: [GET]
@@ -57,12 +74,14 @@ rules:
       container_id: "[a-f0-9]+"  # Match container IDs with hexadecimal characters
       log_type: "stdout|stderr"  # Match only stdout or stderr
 
+  # ===== Regex Path Matching =====
   # Allow inspecting containers using regex pattern
   - endpoint: "^/containers/[a-f0-9]+/json$"  # Match container IDs with hexadecimal characters
     methods: [GET]
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
 
+  # ===== Request Body Validation =====
   # Allow creating containers but restrict options
   - endpoint: /containers/create
     methods: [POST]
@@ -70,8 +89,8 @@ rules:
     process_binaries: ["/usr/bin/docker"]
     # json_conditions is deprecated, use request_rules instead
     request_rules:
-      "$.HostConfig.Privileged": false
-      "$.HostConfig.PidMode": null
+      "$.HostConfig.Privileged": false  # Ensure containers are not privileged
+      "$.HostConfig.PidMode": null      # Ensure PidMode is not set
 
   # Allow starting, stopping, and removing containers
   - endpoint: /containers/
@@ -79,18 +98,27 @@ rules:
     allow: true
     process_binaries: ["/usr/bin/docker"]
 
-  # Allow listing images
+  # ===== Response Body Validation =====
+  # Allow listing images with response validation
   - endpoint: /images/json
     methods: [GET]
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
-    # Example of using both request_rules and response_rules
-    # This is just an example, in practice you might not need rules for GET requests without a body
+    response_rules:
+      "$[0].RepoTags": ["*"]  # Ensure images have tags
+
+  # ===== Combined Request and Response Rules =====
+  # Example of using both request_rules and response_rules
+  - endpoint: /images/json
+    methods: [GET]
+    allow: true
+    process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
     request_rules:
       "$.filters.reference": null  # No specific reference filter
     response_rules:
       "$[0].RepoTags": ["*"]  # Ensure images have tags
 
+  # ===== Other Docker API Examples =====
   # Allow pulling images
   - endpoint: /images/create
     methods: [POST]
@@ -114,3 +142,15 @@ rules:
     methods: [GET]
     allow: true
     process_binaries: ["/usr/bin/docker", "/usr/local/bin/docker-compose"]
+
+  # ===== Deny Rules =====
+  # Explicitly deny access to system containers
+  - endpoint: /containers/system
+    allow: false
+    # No methods specified means all methods are matched
+    # No process_binaries specified means all processes are matched
+
+  # Deny all other requests to the containers endpoint that don't match previous rules
+  - endpoint: /containers
+    allow: false
+    # This acts as a catch-all rule for any container-related endpoints not explicitly allowed above

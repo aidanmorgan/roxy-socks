@@ -20,7 +20,7 @@ class TestRoxyIntegration:
         # Create the model and configure roxy
         with_roxy_config(RoxyConfig(rules=[
             Rule(
-                endpoint="/containers/json.*$",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
                 allow=True,
             )
@@ -39,7 +39,7 @@ class TestRoxyIntegration:
         # Create the model and configure roxy
         with_roxy_config(RoxyConfig(rules=[
             Rule(
-                endpoint="/containers/json.*$",
+                endpoint="/v1.*/containers/json.*$",
                 methods=["GET"],
                 allow=True,
                 request_rules={

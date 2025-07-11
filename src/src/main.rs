@@ -37,7 +37,7 @@ struct Args {
     log_dir: PathBuf,
 
     /// Timeout in seconds for network operations
-    #[arg(short, long, default_value = "10")]
+    #[arg(short, long, default_value = "30")]
     timeout: u64,
 
     /// Log rotation duration (hourly, daily, never)
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 
     if !args.no_default_rules {
         add_default_rules(&mut config.rules);
-        warn!("Default rule allowing GET requests to /version endpoint is enabled. Use --disable-version-endpoint to disable this behavior.");
+        warn!("Default rule allowing GET requests to /version endpoint is enabled. Use --no-default-rules to disable this behavior.");
     }
 
     // Override timeout with command line argument if provided
@@ -81,7 +81,6 @@ async fn main() -> Result<()> {
     // Create a shared configuration that can be updated
     let shared_config = SharedConfig::new(config);
 
-    // Print a warning if the default version endpoint rule is enabled
     // Set up the configuration file watcher
     let watcher_config = shared_config.clone();
     let config_path_for_watcher = args.config_path.clone();

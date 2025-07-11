@@ -56,11 +56,11 @@ roxy-socks [OPTIONS]
 
 ### Options
 
-- `-s, --socket-path <PATH>`: Path to the socket to create (default: `/var/run/roxy`)
+- `-s, --socket-path <PATH>`: Path to the socket to create (default: `/var/run/roxy.sock`)
 - `-d, --docker-socket <PATH>`: Path to the Docker socket (default: `/var/run/docker.sock`)
 - `-c, --config-path <PATH>`: Path to the rules configuration file (default: `/etc/roxy/config.yml`)
 - `-l, --log-dir <PATH>`: Path to the log directory (default: `/var/log/roxy`)
-- `-t, --timeout <SECONDS>`: Timeout in seconds for network operations (default: `5`)
+- `-t, --timeout <SECONDS>`: Timeout in seconds for network operations (default: `10`)
 - `-r, --log-rotation <ROTATION>`: Log rotation duration (hourly, daily, never) (default: `daily`)
 - `--no-default-rules`: Disable the default rules that allow GET requests to the /version endpoint
 
