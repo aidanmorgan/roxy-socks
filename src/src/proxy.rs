@@ -15,7 +15,6 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::buffered_request::BufferedRequest;
 use crate::config::Config;
-use crate::file_watcher;
 use crate::logging;
 use crate::process;
 use crate::rules;
@@ -86,44 +85,23 @@ async fn check_docker_socket_accessibility(docker_socket: &Path) -> Result<()> {
 /// Note: The timeout parameter in the Config struct is applied to the full request processing loop,
 /// ensuring that each connection is processed within the specified timeout period.
 // Removed instrument attribute to avoid lifetime issues
-pub async fn start_proxy<P1, P2, P3>(
+pub async fn start_proxy<P1, P2>(
     socket_path: P1,
     docker_socket: P2,
-    config: Config,
-    config_path: P3
+    shared_config: &SharedConfig
 ) -> Result<()>
 where
     P1: AsRef<Path> + std::fmt::Debug + 'static,
-    P2: AsRef<Path> + std::fmt::Debug + 'static,
-    P3: AsRef<Path> + std::fmt::Debug + 'static,
+    P2: AsRef<Path> + std::fmt::Debug + 'static
 {
     let socket_path = socket_path.as_ref();
     let docker_socket = docker_socket.as_ref();
-    let config_path_ref = config_path.as_ref();
 
     // Check Docker socket accessibility before starting the proxy
     if let Err(e) = check_docker_socket_accessibility(docker_socket).await {
         error!("Docker accessibility check failed. Cannot start proxy: {}", e);
         return Err(anyhow::anyhow!("Docker socket is not accessible: {}. Make sure the Docker daemon is running and the socket has correct permissions.", e));
     }
-
-    // Create an owned PathBuf for the config path to use in async tasks
-    let config_path_owned = config_path_ref.to_path_buf();
-
-    // Create a shared configuration that can be updated
-    let shared_config = SharedConfig::new(config);
-
-    // Print a warning if the default version endpoint rule is enabled
-    // Set up the configuration file watcher
-    let watcher_config = shared_config.clone();
-    let config_path_for_watcher = config_path_owned.clone();
-    tokio::spawn(async move {
-        if let Err(e) = file_watcher::watch_config_with_shared(config_path_for_watcher, watcher_config).await {
-            error!("Config watcher error: {}", e);
-        }
-    });
-
-    info!("Watching configuration file for changes: {}", config_path_owned.display());
 
     // Create the parent directory if it doesn't exist
     if let Some(parent) = socket_path.parent() {
@@ -269,11 +247,6 @@ async fn handle_request(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    debug!(
-        "Received request: method={}, path={}, from pid={}, binary={}",
-        method, path, process_info.pid, process_info.binary
-    );
-
     // Check if any rule has JSON conditions in request_rules
     let _has_json_conditions = config.rules.iter().any(|rule| {
         if let Some(rules) = &rule.request_rules {
@@ -289,11 +262,9 @@ async fn handle_request(
         let (parts, body) = req.into_parts();
         match BufferedRequest::from_request(Request::from_parts(parts, body)).await {
             Ok(buffered) => {
-                debug!("Buffered request body for JSON path checking");
                 buffered
             }
             Err(e) => {
-                error!("Failed to buffer request body: {}", e);
                 logging::log_request(
                     method.as_str(),
                     &path,
@@ -318,10 +289,7 @@ async fn handle_request(
         Ok(result) => {
             if result.allowed {
                 // Request is allowed, forward it to the Docker socket
-                info!(
-                    "Forwarding request: method={}, path={}, from pid={}, binary={}",
-                    method, path, process_info.pid, process_info.binary
-                );
+                info!("Forwarding request to Docker");
 
                 logging::log_request(
                     method.as_str(),
@@ -336,11 +304,16 @@ async fn handle_request(
                 let (parts, body) = req.into_parts();
                 let uri = hyperlocal::Uri::new(docker_socket, parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
 
-                let docker_req = Request::builder()
+                // Build the request and copy all headers
+                let mut builder = Request::builder()
                     .method(parts.method)
-                    .uri(uri)
-                    .body(body)
-                    .unwrap();
+                    .uri(uri);
+                    
+                for (key, value) in parts.headers.iter() {
+                    builder = builder.header(key, value);
+                }
+
+                let docker_req = builder.body(body).unwrap();
 
                 // Get the matching rule that allowed this request
                 let matching_rule = if let Some(rule_index) = result.matching_rule_index {

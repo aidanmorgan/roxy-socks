@@ -8,6 +8,39 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, trace};
 
+pub fn add_default_rules(rules: &mut Vec<crate::rules::Rule>) {
+    // setup the default rules that are required to be added if they aren't present
+    if !rules.iter().any(|rule| rule.endpoint == String::from("/version") && rule.methods.contains(&String::from("GET"))) {
+        rules.push(Rule {
+            endpoint: String::from("/version"),
+            methods: vec![String::from("GET")],
+            allow: true,
+            request_rules: None,
+            response_rules: None,
+            process_binaries: None,
+            path_variables: None,
+            path_regex: None,
+            match_query_params: QueryParamMatch::Ignore,
+            query_params: None,
+        });
+    }
+
+    if !rules.iter().any(|rule| rule.endpoint == String::from("/v1.*/version") && rule.methods.contains(&String::from("GET"))) {
+        rules.push(Rule {
+            endpoint: String::from("/v1.*/version"),
+            methods: vec![String::from("GET")],
+            allow: true,
+            request_rules: None,
+            response_rules: None,
+            process_binaries: None,
+            path_variables: None,
+            path_regex: None,
+            match_query_params: QueryParamMatch::Ignore,
+            query_params: None,
+        });
+    }
+}
+
 
 /// Checks if a string is intended to be a regex pattern.
 /// 

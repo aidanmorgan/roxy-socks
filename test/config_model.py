@@ -22,7 +22,7 @@ class Rule(BaseModel):
     """Model for a single rule in the roxy-socks configuration."""
     endpoint: str
     methods: List[str]
-    allow: bool
+    allow: bool = True
     process_binaries: Optional[List[str]] = None
     path_variables: Optional[Dict[str, str]] = None
     path_regex: Optional[str] = None
@@ -34,10 +34,10 @@ class Rule(BaseModel):
 
 class RoxyConfig(BaseModel):
     """Model for the roxy-socks configuration file."""
-    rules: List[Rule]
+    rules: List[Rule] = Field(default_factory=list)
 
     def __init__(self, **data):
-        """Initialize the configuration, ensuring there's always a rule for /version endpoint."""
+        """Initialize the configuration"""
         super().__init__(**data)
 
 

@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, Config};
+use crate::rules::{add_default_rules};
 use crate::shared_config::SharedConfig;
 
 /// Struct to manage file watching and configuration reloading
@@ -131,13 +132,31 @@ async fn watch_config_file(
 
 /// Check if an event is relevant to the configuration file
 fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
+    debug!("Checking if event is relevant - config_path: {:?}, event: {:?}", config_path, event);
     if let EventKind::Modify(_) | EventKind::Create(_) = event.kind {
         for path in &event.paths {
-            if path == config_path {
+            debug!("Comparing event path: {:?} with config path: {:?}", path, config_path);
+            
+            // Normalize paths by resolving symlinks and canonicalizing
+            let normalized_event_path = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => path.clone(),
+            };
+            
+            let normalized_config_path = match config_path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => config_path.to_path_buf(),
+            };
+            
+            debug!("Normalized event path: {:?}, normalized config path: {:?}", normalized_event_path, normalized_config_path);
+            
+            if normalized_event_path == normalized_config_path {
+                debug!("Path match found!");
                 return true;
             }
         }
     }
+    debug!("Event not relevant");
     false
 }
 
@@ -145,6 +164,7 @@ fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
 pub async fn watch_config_with_shared(
     config_path: impl AsRef<Path>,
     shared_config: SharedConfig,
+    include_default_rules: bool,
 ) -> Result<()> {
     let config_path = config_path.as_ref().to_path_buf();
 
@@ -173,6 +193,7 @@ pub async fn watch_config_with_shared(
 
     // Process file system events
     while let Some(event) = watcher_rx.recv().await {
+        debug!("Received file system event: {:?}", event);
         if is_relevant_event(&event, &config_path) {
             debug!("Detected change to configuration file: {}", config_path.display());
 
@@ -182,18 +203,21 @@ pub async fn watch_config_with_shared(
             // Try to load the new configuration
             match config::load_config(&config_path) {
                 Ok(new_config) => {
-                    info!(
-                        "Reloaded configuration with {} rules",
-                        new_config.rules.len()
-                    );
+                    let mut to_update = new_config.clone();
+                    info!("Reloaded configuration with {} rules", new_config.rules.len());
 
-                    // Update the shared configuration
-                    shared_config.update(new_config);
+                    if include_default_rules {
+                        add_default_rules(&mut to_update.rules);
+                    }
+
+                    shared_config.update(to_update);
                 }
                 Err(e) => {
                     warn!("Failed to reload configuration: {}", e);
                 }
             }
+        } else {
+            debug!("Event not relevant for config file: {:?}", event);
         }
     }
 

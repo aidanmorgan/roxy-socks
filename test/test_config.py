@@ -1,8 +1,9 @@
 import pytest
+from typing import Any
 from config_model import RoxyConfig, Rule, QueryParamMatch
 
 
-def test_config_generation():
+def test_config_generation() -> None:
     """Test that the configuration generation mechanism works correctly."""
     # Create a sample RoxyConfig model for testing
     config_model = RoxyConfig(rules=[
@@ -30,7 +31,7 @@ def test_config_generation():
     assert len(config_from_yaml.rules) == len(config_model.rules)
 
 
-def test_query_param_match():
+def test_query_param_match() -> None:
     """Test that the query parameter matching functionality works correctly."""
     # Create a rule with required query parameters
     rule_required = Rule(

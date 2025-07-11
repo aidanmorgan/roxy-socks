@@ -4,7 +4,9 @@ use std::process as std_process;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info, warn};
-use crate::rules::{QueryParamMatch, Rule};
+use crate::config::Config;
+use crate::rules::{add_default_rules, QueryParamMatch, Rule};
+use crate::shared_config::SharedConfig;
 
 mod buffered_request;
 mod config;
@@ -43,8 +45,8 @@ struct Args {
     log_rotation: String,
 
     /// Disable the default rule that allows GET requests to the /version endpoint
-    #[arg(long, action = clap::ArgAction::SetFalse)]
-    disable_version_endpoint: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_default_rules: bool,
 }
 
 #[tokio::main]
@@ -62,53 +64,41 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let mut config = config::load_config(&args.config_path)
-        .context("Failed to load configuration")?;
+        .unwrap_or(Config {
+            rules: vec![],
+            timeout: args.timeout,
+        });
 
-    if !args.disable_version_endpoint {
-        if !config.rules.iter().any(|rule| rule.endpoint == String::from("/version")) {
-            config.rules.push(Rule {
-                endpoint: String::from("/version"),
-                methods: vec![String::from("GET")],
-                allow: true,
-                request_rules: None,
-                response_rules: None,
-                process_binaries: None,
-                path_variables: None,
-                path_regex: None,
-                match_query_params: QueryParamMatch::Ignore,
-                query_params: None,
-            });
-
-            config.rules.push(Rule {
-                endpoint: String::from("/v1.*/version"),
-                methods: vec![String::from("GET")],
-                allow: true,
-                request_rules: None,
-                response_rules: None,
-                process_binaries: None,
-                path_variables: None,
-                path_regex: None,
-                match_query_params: QueryParamMatch::Ignore,
-                query_params: None,
-            });
-
-
-            warn!("Default rule allowing GET requests to /version endpoint is enabled. Use --disable-version-endpoint to disable this behavior.");
-        }
+    if !args.no_default_rules {
+        add_default_rules(&mut config.rules);
+        warn!("Default rule allowing GET requests to /version endpoint is enabled. Use --disable-version-endpoint to disable this behavior.");
     }
 
     // Override timeout with command line argument if provided
     config.timeout = args.timeout;
-
-    // Log the configuration
     info!("Configuration: {:?}", config);
+
+    // Create a shared configuration that can be updated
+    let shared_config = SharedConfig::new(config);
+
+    // Print a warning if the default version endpoint rule is enabled
+    // Set up the configuration file watcher
+    let watcher_config = shared_config.clone();
+    let config_path_for_watcher = args.config_path.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = file_watcher::watch_config_with_shared(config_path_for_watcher, watcher_config, !args.no_default_rules).await {
+            error!("Config watcher error: {}", e);
+        }
+    });
+
+    info!("Watching configuration file for changes: {}", args.config_path.display());
 
     // Start the proxy server
     match proxy::start_proxy(
         args.socket_path, 
         args.docker_socket, 
-        config, 
-        args.config_path.clone()
+        &shared_config
     ).await {
         Ok(_) => {
             info!("Proxy server stopped gracefully");
