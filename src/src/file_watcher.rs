@@ -101,7 +101,7 @@ async fn watch_config_file(
             debug!("Detected change to configuration file: {}", config_path.display());
 
             // Add a small delay to ensure the file is fully written
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(500)).await;
 
             // Try to load the new configuration
             match config::load_config(&config_path) {
@@ -132,11 +132,8 @@ async fn watch_config_file(
 
 /// Check if an event is relevant to the configuration file
 fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
-    debug!("Checking if event is relevant - config_path: {:?}, event: {:?}", config_path, event);
     if let EventKind::Modify(_) | EventKind::Create(_) = event.kind {
         for path in &event.paths {
-            debug!("Comparing event path: {:?} with config path: {:?}", path, config_path);
-            
             // Normalize paths by resolving symlinks and canonicalizing
             let normalized_event_path = match path.canonicalize() {
                 Ok(canonical) => canonical,
@@ -147,16 +144,13 @@ fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
                 Ok(canonical) => canonical,
                 Err(_) => config_path.to_path_buf(),
             };
-            
-            debug!("Normalized event path: {:?}, normalized config path: {:?}", normalized_event_path, normalized_config_path);
-            
+
             if normalized_event_path == normalized_config_path {
-                debug!("Path match found!");
                 return true;
             }
         }
     }
-    debug!("Event not relevant");
+    
     false
 }
 
@@ -193,12 +187,9 @@ pub async fn watch_config_with_shared(
 
     // Process file system events
     while let Some(event) = watcher_rx.recv().await {
-        debug!("Received file system event: {:?}", event);
         if is_relevant_event(&event, &config_path) {
-            debug!("Detected change to configuration file: {}", config_path.display());
-
             // Add a small delay to ensure the file is fully written
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(500)).await;
 
             // Try to load the new configuration
             match config::load_config(&config_path) {
@@ -216,8 +207,6 @@ pub async fn watch_config_with_shared(
                     warn!("Failed to reload configuration: {}", e);
                 }
             }
-        } else {
-            debug!("Event not relevant for config file: {:?}", event);
         }
     }
 

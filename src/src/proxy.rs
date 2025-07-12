@@ -44,7 +44,7 @@ where
 /// This function attempts to connect to the Docker socket and make a simple request
 /// to verify that the socket is accessible and functioning correctly.
 #[instrument(skip(docker_socket))]
-async fn check_docker_socket_accessibility(docker_socket: &Path) -> Result<()> {
+async fn check_docker_socket_accessibility(docker_socket: &Path, timeout_seconds: u64) -> Result<()> {
     info!("Checking Docker socket accessibility at: {}", docker_socket.display());
 
     // Create a client for the Docker socket
@@ -59,7 +59,7 @@ async fn check_docker_socket_accessibility(docker_socket: &Path) -> Result<()> {
         .context("Failed to build request for Docker version check")?;
 
     // Send the request with a timeout
-    match timeout(Duration::from_secs(5), client.request(request)).await {
+    match timeout(Duration::from_secs(timeout_seconds), client.request(request)).await {
         Ok(response_result) => {
             match response_result {
                 Ok(response) => {
@@ -105,7 +105,7 @@ where
     let docker_socket = docker_socket.as_ref();
 
     // Check Docker socket accessibility before starting the proxy
-    if let Err(e) = check_docker_socket_accessibility(docker_socket).await {
+    if let Err(e) = check_docker_socket_accessibility(docker_socket, shared_config.read().timeout).await {
         error!("Docker accessibility check failed. Cannot start proxy: {}", e);
         return Err(anyhow::anyhow!("Docker socket is not accessible: {}. Make sure the Docker daemon is running and the socket has correct permissions.", e));
     }

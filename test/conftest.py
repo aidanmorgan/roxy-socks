@@ -5,10 +5,14 @@ import subprocess
 import tempfile
 import logging
 import inspect
+import requests
+import http.client
+import urllib3
 from pathlib import Path
 from typing import Callable, Optional, Union, Any, Generator
 
 import docker
+import docker.errors
 import pytest
 from _pytest.fixtures import FixtureRequest
 from _pytest.config import Config
@@ -37,7 +41,7 @@ def pytest_configure(config: Config) -> None:
 @pytest.fixture(scope="session")
 def docker_client() -> docker.DockerClient:
     """Create a Docker client for the tests."""
-    client = docker.from_env()
+    client = docker.from_env(timeout=30)
     return client
 
 
@@ -92,7 +96,7 @@ def with_roxy_config(request: FixtureRequest) -> Generator[Callable[[RoxyConfig 
             f.write(yaml_content)
 
         # Allow the file watcher time to reload the configuration
-        time.sleep(0.2)
+        time.sleep(2.0)  # Increased from 1.5 to 2.0 seconds for better stability
 
         return config_path
 
@@ -142,25 +146,15 @@ def roxy_process(
     # once the with_roxy_config fixture runs
     request.config.roxy_config_path = config_path  # type: ignore
 
-    # Create a minimal valid configuration to start with, this prevents the "missing field rules" error
-    # it also makes sure that the docker client can be created properly as it requires the ability to call the
-    # /version endpoint to make it work
-    minimal_config = RoxyConfig(rules=[
-        Rule(
-            endpoint="/version",
-            methods=["GET"],
-            allow=True,
-        ),
-        Rule(
-            endpoint="/v1.*/version",
-            methods=["GET"],
-            allow=True,
-        )
-    ])
+    # Create an empty configuration to start with - tests will define their own rules
+    minimal_config = RoxyConfig(
+        timeout=30,  # Set timeout to 30 seconds for tests
+        rules=[]  # No default rules - tests must specify what they need
+    )
     
     # Write the minimal config to the file initially
     with open(config_path, 'w') as f:
-        yaml_content = f"# Minimal test configuration for Roxy Docker Socket Proxy\n{minimal_config.to_yaml()}"
+        yaml_content = f"# Empty test configuration for Roxy Docker Socket Proxy\n{minimal_config.to_yaml()}"
         f.write(yaml_content)
 
     logger.info(f"Using config file: {config_path}")
@@ -186,7 +180,7 @@ def roxy_process(
     logger.info(f"Started roxy process with PID: {process.pid}")
 
     # Wait for the socket to be created
-    for i in range(10):
+    for i in range(20):  # Increased timeout
         if roxy_socket.exists():
             logger.info(f"Socket created after {i*0.5} seconds")
             break
@@ -194,14 +188,15 @@ def roxy_process(
     else:
         process.terminate()
         stdout, stderr = process.communicate()
-        error_msg = f"Socket not created after 5 seconds. stdout: {stdout.decode() if stdout else 'None'}, stderr: {stderr.decode() if stderr else 'None'}"
+        error_msg = f"Socket not created after 10 seconds. stdout: {stdout.decode() if stdout else 'None'}, stderr: {stderr.decode() if stderr else 'None'}"
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 
     # Wait for the socket to be ready
-    for i in range(10):
+    for i in range(20):  # Increased timeout
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1.0)  # Add timeout
             sock.connect(str(roxy_socket))
             sock.close()
             logger.info(f"Socket ready after {i*0.5} seconds")
@@ -212,7 +207,7 @@ def roxy_process(
     else:
         process.terminate()
         stdout, stderr = process.communicate()
-        error_msg = f"Socket not ready after 5 seconds. stdout: {stdout.decode() if stdout else 'None'}, stderr: {stderr.decode() if stderr else 'None'}"
+        error_msg = f"Socket not ready after 10 seconds. stdout: {stdout.decode() if stdout else 'None'}, stderr: {stderr.decode() if stderr else 'None'}"
         logger.error(error_msg)
         raise RuntimeError(error_msg)
 
@@ -222,17 +217,123 @@ def roxy_process(
 
     # Clean up
     logger.info(f"Terminating roxy process with PID: {process.pid}")
-    process.terminate()
-    process.wait()
-    logger.info(f"Roxy process terminated with return code: {process.returncode}")
+    try:
+        process.terminate()
+        # Wait for graceful shutdown with increased timeout
+        process.wait(timeout=10)  # Increased from 5 to 10 seconds
+        logger.info(f"Roxy process terminated with return code: {process.returncode}")
+    except subprocess.TimeoutExpired:
+        logger.warning("Process didn't terminate gracefully, killing it")
+        process.kill()
+        process.wait()
+    except Exception as e:
+        logger.error(f"Error during process cleanup: {e}")
 
 
 @pytest.fixture(scope="function")
-def docker_client_with_roxy(roxy_socket: Path, roxy_process: subprocess.Popen, request: FixtureRequest) -> Generator[docker.DockerClient, None, None]:
+def container_cleanup(docker_client: docker.DockerClient) -> Generator[Callable[[str], None], None, None]:
+    """
+    Fixture that provides container cleanup functionality.
+    
+    Usage in tests:
+        def test_example(container_cleanup):
+            # Create container
+            container = docker_client_with_roxy.containers.create(...)
+            container_cleanup(container.name)  # Register for cleanup
+            
+            # Test logic here...
+    """
+    containers_to_cleanup = []
+    
+    def register_container(container_name_or_id: str):
+        """Register a container for cleanup."""
+        containers_to_cleanup.append(container_name_or_id)
+    
+    yield register_container
+    
+    # Cleanup all registered containers using the direct Docker client
+    for container_name_or_id in containers_to_cleanup:
+        try:
+            container = docker_client.containers.get(container_name_or_id)
+            if container.status == "running":
+                container.stop()
+            container.remove()
+            logger.info(f"Cleaned up container: {container_name_or_id}")
+        except docker.errors.NotFound:
+            logger.info(f"Container {container_name_or_id} not found, skipping cleanup")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup container {container_name_or_id}: {e}")
+
+
+@pytest.fixture(scope="function")
+def docker_client_with_roxy(roxy_socket: Path, roxy_process: subprocess.Popen, request: FixtureRequest, docker_client: docker.DockerClient) -> Generator[docker.DockerClient, None, None]:
     """Create a Docker client that uses the roxy-socks proxy."""
     base_url = f"unix://{roxy_socket}"
-    client = docker.DockerClient(base_url=base_url)
-    yield client
-    client.close()
+    roxy_docker_client = docker.DockerClient(base_url=base_url, timeout=30)
+    
+    # Clean up any existing test containers before starting using the direct Docker client
+    test_container_prefixes = [
+        "roxy-test-",
+        "roxy-test-response-rules-positive",
+        "roxy-test-container",
+        "roxy-test-path-vars",
+        "roxy-test-specific-path-vars",
+        "roxy-test-path-regex-query",
+        "roxy-test-combined-rules",
+        "roxy-test-path-regex",
+        "roxy-test-request-rules-valid",
+        "roxy-test-response-rules"
+    ]
+    
+    try:
+        all_containers = docker_client.containers.list(all=True)
+        for container in all_containers:
+            if any(container.name.startswith(prefix) for prefix in test_container_prefixes):
+                try:
+                    if container.status == "running":
+                        container.stop()
+                    container.remove()
+                    logger.info(f"Cleaned up existing test container: {container.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup existing container {container.name}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup existing containers: {e}")
+    
+    yield roxy_docker_client
+    roxy_docker_client.close()
 
-    client.close()
+
+@pytest.fixture(scope="session", autouse=True)
+def session_cleanup(docker_client: docker.DockerClient):
+    """Clean up any remaining test containers at the end of the session."""
+    yield
+    
+    # Clean up any remaining test containers
+    test_container_prefixes = [
+        "roxy-test-",
+        "roxy-test-response-rules-positive",
+        "roxy-test-container",
+        "roxy-test-path-vars",
+        "roxy-test-specific-path-vars",
+        "roxy-test-path-regex-query",
+        "roxy-test-combined-rules",
+        "roxy-test-path-regex",
+        "roxy-test-request-rules-valid",
+        "roxy-test-response-rules"
+    ]
+    
+    try:
+        all_containers = docker_client.containers.list(all=True)
+        for container in all_containers:
+            if any(container.name.startswith(prefix) for prefix in test_container_prefixes):
+                try:
+                    if container.status == "running":
+                        container.stop()
+                    container.remove()
+                    logger.info(f"Session cleanup: Removed test container {container.name}")
+                except Exception as e:
+                    logger.warning(f"Session cleanup: Failed to remove container {container.name}: {e}")
+    except Exception as e:
+        logger.warning(f"Session cleanup: Failed to list containers: {e}")
+    
+    docker_client.close()

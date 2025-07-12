@@ -48,3 +48,5 @@ tempfile = "3.8"
 # File watching
 notify = "6.1"
 log = "0.4.27"
+# URL encoding/decoding
+urlencoding = "2.1"

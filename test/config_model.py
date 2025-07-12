@@ -34,6 +34,7 @@ class Rule(BaseModel):
 class RoxyConfig(BaseModel):
     """Model for the roxy-socks configuration file."""
     rules: List[Rule] = Field(default_factory=list)
+    timeout: int = 30  # Default to 30 seconds for tests
 
     def __init__(self, **data):
         """Initialize the configuration"""
