@@ -269,7 +269,7 @@ def container_cleanup(docker_client: docker.DockerClient) -> Generator[Callable[
 def docker_client_with_roxy(roxy_socket: Path, roxy_process: subprocess.Popen, request: FixtureRequest, docker_client: docker.DockerClient) -> Generator[docker.DockerClient, None, None]:
     """Create a Docker client that uses the roxy-socks proxy."""
     base_url = f"unix://{roxy_socket}"
-    roxy_docker_client = docker.DockerClient(base_url=base_url, timeout=30)
+    roxy_docker_client = docker.DockerClient(base_url=base_url, timeout=30, version='auto')
     
     # Clean up any existing test containers before starting using the direct Docker client
     test_container_prefixes = [
