@@ -1,11 +1,11 @@
 use std::path::PathBuf;
-use std::process as std_process;
+use std::process::exit;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info, warn};
 use crate::config::Config;
-use crate::rules::{add_default_rules, QueryParamMatch, Rule};
+use crate::rules::add_default_rules;
 use crate::shared_config::SharedConfig;
 
 mod buffered_request;
@@ -104,8 +104,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Err(e) => {
+            // if we get an error here, exit the proxy, rely on init.d to restart assuming it's recoverable
             error!("Proxy server error: {}", e);
-            std_process::exit(1);
+            exit(1);
         }
     }
 }

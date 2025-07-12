@@ -1,7 +1,5 @@
-use std::os::unix::net::UnixStream;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
-use std::mem;
 
 use anyhow::{Context, Result};
 use tracing::{debug, trace, warn};
@@ -41,7 +39,7 @@ pub fn get_process_info(_stream: &TokioUnixStream) -> Result<ProcessInfo> {
 
         // Create a standard UnixStream from the raw file descriptor
         // This is unsafe because we need to ensure the file descriptor is not closed twice
-        let std_stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
 
         // Get the peer credentials using the standard UnixStream
         let ucred = std_stream
@@ -53,7 +51,7 @@ pub fn get_process_info(_stream: &TokioUnixStream) -> Result<ProcessInfo> {
 
         // Forget the standard UnixStream to prevent it from closing the file descriptor
         // when it's dropped, since the Tokio UnixStream will close it when it's dropped
-        mem::forget(std_stream);
+        std::mem::forget(std_stream);
 
         get_process_info_by_pid(pid)
     }
@@ -169,7 +167,6 @@ fn get_peer_pid_macos(fd: i32) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn test_get_process_info_by_pid() {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A proxy for the Docker socket with configurable ACLs"
 authors = ["Aidan Morgan"]
+rust-version = "1.70"
 
 [[bin]]
 name = "roxy-socks"

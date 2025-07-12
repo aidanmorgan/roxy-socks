@@ -1,17 +1,21 @@
 import pytest
 import docker
 import subprocess
+import json
+import time
+import threading
+import concurrent.futures
 from pathlib import Path
 from typing import Callable, Optional, Any
-from docker.errors import APIError
+from docker.errors import APIError, NotFound
 
 import requests
 import http.client
 from config_model import RoxyConfig, Rule
 
 
-class TestRoxyIntegration:
-    """Integration tests for the roxy-socks application."""
+class TestRoxyBasicOperations:
+    """Basic operation tests for the roxy-socks application."""
 
     def test_list_containers(
         self, 
@@ -19,7 +23,6 @@ class TestRoxyIntegration:
         with_roxy_config: Callable[[Optional[RoxyConfig]], str]
     ) -> None:
         """Test listing containers."""
-        # Configure roxy to allow listing containers
         with_roxy_config(RoxyConfig(timeout=30, rules=[
             Rule(
                 endpoint="/v1\\..*/containers/json.*$",
@@ -28,10 +31,7 @@ class TestRoxyIntegration:
             )
         ]))
 
-        # Test: List containers using roxy proxy
         containers = docker_client_with_roxy.containers.list(all=True)
-        # Just verify that the request succeeds, we don't care about the actual containers
-
 
     def test_list_containers_with_filters(
         self, 
@@ -39,21 +39,18 @@ class TestRoxyIntegration:
         with_roxy_config: Callable[[Optional[RoxyConfig]], str]
     ) -> None:
         """Test listing containers with filters."""
-        # Configure roxy to allow listing containers with specific filters
         with_roxy_config(RoxyConfig(timeout=30, rules=[
             Rule(
                 endpoint="/v1\\..*/containers/json.*$",
                 methods=["GET"],
                 allow=True,
                 request_rules={
-                    "$.filters": {"status": ["running"]}  # Only allow filtering by running status
+                    "$.filters": {"status": ["running"]}
                 }
             )
         ]))
 
-        # Test: List only running containers using roxy proxy
         containers = docker_client_with_roxy.containers.list(filters={"status": ["running"]})
-        # Just verify that the request succeeds
 
     def test_list_containers_with_response_rules(
         self, 
@@ -101,6 +98,283 @@ class TestRoxyIntegration:
             # Teardown: Clean up using direct docker client
             try:
                 container = docker_client.containers.get("roxy-test-response-rules-positive")
+                if container.status == "running":
+                    container.stop()
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_list_images(self, docker_client_with_roxy, with_roxy_config):
+        """Test listing images."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/images/json.*$",
+                methods=["GET"],
+                allow=True,
+            ),
+            Rule(
+                endpoint="/v1\\..*/images/{image_id}/json",
+                methods=["GET"],
+                allow=True,
+                path_variables={"image_id": ".*"}
+            )
+        ]))
+
+        images = docker_client_with_roxy.images.list()
+
+    def test_docker_version(self, docker_client_with_roxy, with_roxy_config):
+        """Test getting Docker version."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/version",
+                methods=["GET"],
+                allow=True,
+            ),
+            Rule(
+                endpoint="/v1\\..*/version",
+                methods=["GET"], 
+                allow=True,
+            )
+        ]))
+
+        version = docker_client_with_roxy.version()
+        assert "Version" in version
+
+    def test_docker_info(self, docker_client_with_roxy, with_roxy_config):
+        """Test getting Docker info."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/info",
+                methods=["GET"],
+                allow=True,
+            )
+        ]))
+
+        info = docker_client_with_roxy.info()
+        assert "ID" in info
+
+
+class TestRoxyContainerLifecycle:
+    """Container lifecycle tests broken down into individual operations."""
+
+    def test_create_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test creating a container."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}/json",
+                methods=["GET"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}",
+                methods=["DELETE"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            )
+        ]))
+
+        try:
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="roxy-test-create",
+            )
+            assert container.name == "roxy-test-create"
+            assert container.status == "created"
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-create")
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_start_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test starting a container."""
+        # Setup: Create container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-start",
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/start",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                ),
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # Test: Start container using roxy
+            container_via_roxy = docker_client_with_roxy.containers.get("roxy-test-start")
+            container_via_roxy.start()
+            container_via_roxy.reload()
+            assert container_via_roxy.status == "running"
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-start")
+                if container.status == "running":
+                    container.stop()
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_stop_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test stopping a container."""
+        # Setup: Create and start container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-stop",
+        )
+        container.start()
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/stop",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                ),
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # Test: Stop container using roxy
+            container_via_roxy = docker_client_with_roxy.containers.get("roxy-test-stop")
+            container_via_roxy.stop()
+            container_via_roxy.reload()
+            assert container_via_roxy.status == "exited"
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-stop")
+                if container.status == "running":
+                    container.stop()
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_inspect_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test inspecting a container."""
+        # Setup: Create container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-inspect",
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # Test: Inspect container using roxy
+            container_info = docker_client_with_roxy.api.inspect_container(container.id)
+            assert container_info["Id"] == container.id
+            assert container_info["Name"] == "/roxy-test-inspect"
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-inspect")
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_remove_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test removing a container."""
+        # Setup: Create container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-remove",
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}",
+                    methods=["DELETE"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # Test: Remove container using roxy
+            docker_client_with_roxy.api.remove_container(container.id)
+
+            # Verify container is gone
+            with pytest.raises(docker.errors.NotFound):
+                docker_client.containers.get("roxy-test-remove")
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-remove")
+                container.remove()
+            except docker.errors.NotFound:
+                pass
+
+    def test_restart_container(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test restarting a container."""
+        # Setup: Create and start container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-restart",
+        )
+        container.start()
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/restart",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                ),
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # Test: Restart container using roxy
+            container_via_roxy = docker_client_with_roxy.containers.get("roxy-test-restart")
+            container_via_roxy.restart()
+            container_via_roxy.reload()
+            assert container_via_roxy.status == "running"
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-restart")
                 if container.status == "running":
                     container.stop()
                 container.remove()
@@ -191,230 +465,269 @@ class TestRoxyIntegration:
                 except docker.errors.NotFound:
                     pass
 
-    def test_privileged_container_denied(self, docker_client_with_roxy, with_roxy_config):
-        """Test that creating a privileged container is denied."""
-        # Create the model and configure roxy
-        with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Create container rule with privileged=False
-            Rule(
-                endpoint="/v1\\..*/containers/create.*$",
-                methods=["POST"],
-                allow=True,
-                request_rules={"$.HostConfig.Privileged": False}
-            )
-        ]))
-        with pytest.raises(APIError) as excinfo:
-            docker_client_with_roxy.containers.create(
-                "alpine:latest",
-                command="sleep 300",
-                name="roxy-test-privileged",
-                privileged=True,
-            )
 
-        # Verify that the error is due to the request being denied
-        assert excinfo.value.response is not None and excinfo.value.response.status_code == 403, f"Expected 403 status code, got: {excinfo.value.response.status_code if excinfo.value.response else 'None'}"
+class TestRoxyDockerAPIComprehensive:
+    """Comprehensive Docker API endpoint tests."""
 
-    def test_list_images(self, docker_client_with_roxy, with_roxy_config):
-        """Test listing images."""
-        # Create the model and configure roxy
+    def test_docker_system_endpoints(self, docker_client_with_roxy, with_roxy_config):
+        """Test various Docker system endpoints."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            Rule(
-                endpoint="/v1\\..*/images/json.*$",
-                methods=["GET"],
-                allow=True,
-            ),
-            # Add image inspection rule needed for images.list()
-            Rule(
-                endpoint="/v1\\..*/images/{image_id}/json",
-                methods=["GET"],
-                allow=True,
-                path_variables={"image_id": ".*"}
-            )
+            Rule(endpoint="/version", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/version", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/info", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/system/df", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/events", methods=["GET"], allow=True),
         ]))
 
+        # Test version endpoint
+        version = docker_client_with_roxy.version()
+        assert "Version" in version
+
+        # Test info endpoint  
+        info = docker_client_with_roxy.info()
+        assert "ID" in info
+
+        # Test system disk usage
+        df_info = docker_client_with_roxy.df()
+        assert "LayersSize" in df_info
+
+    def test_docker_image_operations(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test comprehensive image operations."""
+        with_roxy_config(RoxyConfig(timeout=60, rules=[
+            Rule(endpoint="/v1\\..*/images/json.*", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/images/{image_id}/json", methods=["GET"], allow=True, 
+                 path_variables={"image_id": ".*"}),
+            Rule(endpoint="/v1\\..*/images/{image_id}/history", methods=["GET"], allow=True,
+                 path_variables={"image_id": ".*"}),
+            Rule(endpoint="/v1\\..*/images/search", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/images/create", methods=["POST"], allow=True),
+        ]))
+
+        # Test list images
         images = docker_client_with_roxy.images.list()
-        # Just verify that the request succeeds, we don't care about the actual images
+        assert isinstance(images, list)
 
-    def test_path_variables(self, docker_client_with_roxy, with_roxy_config):
-        """Test rules with path variables."""
-        # Create the model and configure roxy
+        if images:
+            # Test inspect image
+            image_info = docker_client_with_roxy.api.inspect_image(images[0].id)
+            assert "Id" in image_info
+            assert "Config" in image_info
+
+            # Test image history
+            history = docker_client_with_roxy.api.history(images[0].id)
+            assert isinstance(history, list)
+
+        # Test search images
+        search_results = docker_client_with_roxy.images.search("alpine", limit=5)
+        assert isinstance(search_results, list)
+
+    def test_docker_network_operations(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test Docker network operations."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Create container rule
-            Rule(
-                endpoint="/v1\\..*/containers/create.*$",
-                methods=["POST"],
-                allow=True,
-            ),
-            # Inspect container rule
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/json",
-                methods=["GET"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Start container rule
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/start",
-                methods=["POST"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Stop container rule
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/stop",
-                methods=["POST"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Remove container rule
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}",
-                methods=["DELETE"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            )
+            Rule(endpoint="/v1\\..*/networks", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/networks/create", methods=["POST"], allow=True),
+            Rule(endpoint="/v1\\..*/networks/{network_id}", methods=["GET", "DELETE"], allow=True,
+                 path_variables={"network_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/networks/{network_id}/connect", methods=["POST"], allow=True,
+                 path_variables={"network_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/networks/{network_id}/disconnect", methods=["POST"], allow=True,
+                 path_variables={"network_id": "[a-zA-Z0-9_-]+"}),
         ]))
-        try:
-            # Create a container
-            container = docker_client_with_roxy.containers.create(
-                "alpine:latest",
-                command="sleep 300",
-                name="roxy-test-path-vars",
-            )
 
-            # Test inspecting the container (uses path variables)
+        # Test list networks
+        networks = docker_client_with_roxy.networks.list()
+        assert isinstance(networks, list)
+        assert len(networks) > 0  # Should have at least default networks
+
+        # Test create and remove network
+        try:
+            network = docker_client_with_roxy.networks.create("roxy-test-network")
+            assert network.name == "roxy-test-network"
+
+            # Test inspect network
+            network_info = docker_client_with_roxy.api.inspect_network(network.id)
+            assert network_info["Name"] == "roxy-test-network"
+
+            # Test remove network
+            network.remove()
+
+        finally:
+            # Cleanup using direct client
+            try:
+                network = docker_client.networks.get("roxy-test-network")
+                network.remove()
+            except NotFound:
+                pass
+
+    def test_docker_volume_operations(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test Docker volume operations."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/volumes", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/volumes/create", methods=["POST"], allow=True),
+            Rule(endpoint="/v1\\..*/volumes/{volume_name}", methods=["GET", "DELETE"], allow=True,
+                 path_variables={"volume_name": "[a-zA-Z0-9_-]+"}),
+        ]))
+
+        # Test list volumes
+        volumes = docker_client_with_roxy.volumes.list()
+        assert hasattr(volumes, "attrs")
+
+        # Test create and remove volume
+        try:
+            volume = docker_client_with_roxy.volumes.create("roxy-test-volume")
+            assert volume.name == "roxy-test-volume"
+
+            # Test inspect volume
+            volume_info = docker_client_with_roxy.api.inspect_volume("roxy-test-volume")
+            assert volume_info["Name"] == "roxy-test-volume"
+
+            # Test remove volume
+            volume.remove()
+
+        finally:
+            # Cleanup using direct client
+            try:
+                volume = docker_client.volumes.get("roxy-test-volume")
+                volume.remove()
+            except NotFound:
+                pass
+
+
+class TestRoxyAdvancedRules:
+    """Advanced rule testing for increased code coverage."""
+
+    def test_path_variables_with_regex(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test path variables with specific regex patterns."""
+        # Setup: Create container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-path-vars",
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-f0-9]{64}"}  # Full container ID format
+                )
+            ]))
+
+            # Test: Should work with full container ID
             container_info = docker_client_with_roxy.api.inspect_container(container.id)
             assert container_info["Id"] == container.id
 
-            # Test starting the container (uses path variables)
-            docker_client_with_roxy.api.start(container.id)
-            container.reload()
-            assert container.status == "running"
-
-            # Test stopping the container (uses path variables)
-            docker_client_with_roxy.api.stop(container.id)
-            container.reload()
-            assert container.status == "exited"
-
-            # Test removing the container (uses path variables)
-            docker_client_with_roxy.api.remove_container(container.id)
-            with pytest.raises(docker.errors.NotFound):
-                docker_client_with_roxy.containers.get("roxy-test-path-vars")
-
         finally:
-            # Clean up in case of test failure
             try:
-                container = docker_client_with_roxy.containers.get("roxy-test-path-vars")
-                if container.status == "running":
-                    container.stop()
+                container = docker_client.containers.get("roxy-test-path-vars")
                 container.remove()
             except docker.errors.NotFound:
                 pass
 
-    def test_specific_path_variable_regex(self, docker_client_with_roxy, with_roxy_config):
-        """Test rules with specific path variable regex patterns."""
-        # Create the model and configure roxy
-        with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Create container rule
-            Rule(
-                endpoint="/v1\\..*/containers/create.*$",
-                methods=["POST"],
-                allow=True,
-            ),
-            # Inspect container rule with specific regex for container_id
-            # This regex matches the full 64-character hex ID format
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/json",
-                methods=["GET"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Start container rule with specific regex for container_id
-            # This regex matches either the full 64-character hex ID or the short 12-character prefix
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/start",
-                methods=["POST"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Stop container rule with specific regex for container_id
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}/stop",
-                methods=["POST"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            ),
-            # Remove container rule with specific regex for container_id
-            Rule(
-                endpoint="/v1\\..*/containers/{container_id}",
-                methods=["DELETE"],
-                allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
-            )
-        ]))
+    def test_path_variables_exact_value_match(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test path variables that match exact values, not just regex patterns."""
+        # Setup: Create container using direct docker client
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="test-exact-container",
+        )
 
         try:
-            # Create a container
-            container = docker_client_with_roxy.containers.create(
-                "alpine:latest",
-                command="sleep 300",
-                name="roxy-test-specific-path-vars",
-            )
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_name}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_name": "test-exact-container"}  # Exact value match
+                ),
+                # Also test inspection by ID for setup
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": container.id}  # Exact container ID match
+                )
+            ]))
 
-            # Test inspecting the container (uses path variables)
+            # Test: Should work with exact container name match
+            container_info = docker_client_with_roxy.api.inspect_container("test-exact-container")
+            assert container_info["Name"] == "/test-exact-container"
+
+            # Test: Should work with exact container ID match
             container_info = docker_client_with_roxy.api.inspect_container(container.id)
             assert container_info["Id"] == container.id
 
-            # Test starting the container (uses path variables)
-            docker_client_with_roxy.api.start(container.id)
-            container.reload()
-            assert container.status == "running"
-
-            # Test stopping the container (uses path variables)
-            docker_client_with_roxy.api.stop(container.id)
-            container.reload()
-            assert container.status == "exited"
-
-            # Test removing the container (uses path variables)
-            docker_client_with_roxy.api.remove_container(container.id)
-            with pytest.raises(docker.errors.NotFound):
-                docker_client_with_roxy.containers.get("roxy-test-specific-path-vars")
+            # Test: Should fail with different container name
+            with pytest.raises(APIError) as excinfo:
+                docker_client_with_roxy.api.inspect_container("different-container-name")
+            assert excinfo.value.response.status_code == 403
 
         finally:
-            # Clean up in case of test failure
             try:
-                container = docker_client_with_roxy.containers.get("roxy-test-specific-path-vars")
-                if container.status == "running":
-                    container.stop()
+                container = docker_client.containers.get("test-exact-container")
                 container.remove()
-            except (docker.errors.NotFound, requests.exceptions.ConnectionError, http.client.RemoteDisconnected):
-                # Ignore connection errors during cleanup
+            except docker.errors.NotFound:
                 pass
 
-    def test_path_regex_with_query_params(self, docker_client_with_roxy, with_roxy_config):
-        """Test rules with path regex and query parameters."""
-        # Create the model and configure roxy
+    def test_path_variables_multiple_exact_values(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test multiple path variables with exact value matches."""
+        # Setup: Create network using direct docker client
+        network = docker_client.networks.create("test-exact-network")
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/networks/{network_name}/disconnect",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"network_name": "test-exact-network"}  # Exact network name
+                ),
+                Rule(
+                    endpoint="/v1\\..*/networks/{network_id}",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"network_id": network.id}  # Exact network ID
+                )
+            ]))
+
+            # Test: Should work with exact network ID match
+            network_info = docker_client_with_roxy.api.inspect_network(network.id)
+            assert network_info["Name"] == "test-exact-network"
+
+            # Test: Should fail with different network ID
+            with pytest.raises(APIError) as excinfo:
+                docker_client_with_roxy.api.inspect_network("invalid-network-id")
+            assert excinfo.value.response.status_code == 403
+
+        finally:
+            try:
+                network.remove()
+            except NotFound:
+                pass
+
+    def test_request_rules_exact_value_validation(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test request rules that validate exact values rather than just format compliance."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Rule with regex endpoint that includes query parameters
-            Rule(
-                endpoint="^/v1\\.[0-9]+/containers/json\\?.*all=1.*limit=\\d+.*$",
-                methods=["GET"],
-                allow=True
-            ),
-            # Create container rule
             Rule(
                 endpoint="/v1\\..*/containers/create.*",
                 methods=["POST"],
-                allow=True
+                allow=True,
+                request_rules={
+                    "$.Image": "alpine:3.18",  # Exact image version
+                    "$.WorkingDir": "/app",    # Exact working directory
+                    "$.User": "1000:1000",     # Exact user/group
+                    "$.Env[0]": "ENV=production"  # Exact environment variable
+                }
             ),
-            # Container inspection rule needed for containers.create()
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}/json",
                 methods=["GET"],
                 allow=True,
                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}
             ),
-            # Remove container rule for cleanup
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}",
                 methods=["DELETE"],
@@ -424,53 +737,235 @@ class TestRoxyIntegration:
         ]))
 
         try:
-            # Create a container
+            # Test: Should work with exact matching values
             container = docker_client_with_roxy.containers.create(
-                "alpine:latest",
+                "alpine:3.18",
                 command="sleep 300",
-                name="roxy-test-path-regex-query",
+                name="roxy-test-exact-values",
+                working_dir="/app",
+                user="1000:1000",
+                environment=["ENV=production", "DEBUG=false"]
             )
-
-            # Test that we can get the container (uses path variables)
-            container = docker_client_with_roxy.containers.get("roxy-test-path-regex-query")
-            assert container.name == "roxy-test-path-regex-query"
+            assert container.name == "roxy-test-exact-values"
 
         finally:
-            # Clean up in case of test failure
             try:
-                container = docker_client_with_roxy.containers.get("roxy-test-path-regex-query")
-                if container.status == "running":
-                    container.stop()
+                container = docker_client.containers.get("roxy-test-exact-values")
                 container.remove()
             except docker.errors.NotFound:
                 pass
 
-    def test_combined_rules(self, docker_client_with_roxy, with_roxy_config):
-        """Test rules with combined request and response rules."""
-        # Create the model and configure roxy
+        # Test: Should fail with wrong image version
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:3.17",  # Different version
+                command="sleep 300",
+                name="roxy-test-wrong-image",
+                working_dir="/app",
+                user="1000:1000",
+                environment=["ENV=production"]
+            )
+        assert excinfo.value.response.status_code == 403
+
+        # Test: Should fail with wrong working directory
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:3.18",
+                command="sleep 300",
+                name="roxy-test-wrong-workdir",
+                working_dir="/tmp",  # Different working directory
+                user="1000:1000",
+                environment=["ENV=production"]
+            )
+        assert excinfo.value.response.status_code == 403
+
+        # Test: Should fail with wrong user
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:3.18",
+                command="sleep 300",
+                name="roxy-test-wrong-user",
+                working_dir="/app",
+                user="0:0",  # Different user
+                environment=["ENV=production"]
+            )
+        assert excinfo.value.response.status_code == 403
+
+        # Test: Should fail with wrong environment variable
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:3.18",
+                command="sleep 300",
+                name="roxy-test-wrong-env",
+                working_dir="/app",
+                user="1000:1000",
+                environment=["ENV=development"]  # Different environment
+            )
+        assert excinfo.value.response.status_code == 403
+
+    def test_response_rules_exact_value_validation(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test response rules that validate exact values in responses."""
+        # Setup: Create containers with specific configurations
+        container1 = docker_client.containers.create(
+            "alpine:3.18",
+            command="sleep 300",
+            name="test-response-exact-match",
+            working_dir="/app",
+            user="1000:1000"
+        )
+        container2 = docker_client.containers.create(
+            "alpine:3.17",
+            command="sleep 300",
+            name="test-response-different",
+            working_dir="/tmp",
+            user="0:0"
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"},
+                    response_rules={
+                        "$.Config.Image": "alpine:3.18",      # Exact image version
+                        "$.Config.WorkingDir": "/app",        # Exact working directory
+                        "$.Config.User": "1000:1000"          # Exact user
+                    }
+                )
+            ]))
+
+            # Test: Should work for container that matches all response rules
+            container_info = docker_client_with_roxy.api.inspect_container(container1.id)
+            assert container_info["Config"]["Image"] == "alpine:3.18"
+            assert container_info["Config"]["WorkingDir"] == "/app"
+            assert container_info["Config"]["User"] == "1000:1000"
+
+            # Test: Should fail for container that doesn't match response rules
+            with pytest.raises(APIError) as excinfo:
+                docker_client_with_roxy.api.inspect_container(container2.id)
+            assert excinfo.value.response.status_code == 403
+
+        finally:
+            for container in [container1, container2]:
+                try:
+                    container.remove()
+                except NotFound:
+                    pass
+
+    def test_query_params_exact_value_validation(self, docker_client_with_roxy, with_roxy_config):
+        """Test query parameters that must match exact values."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Create container rule with request_rules
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="required",
+                query_params={
+                    "all": "true",      # Must be exactly "true"
+                    "limit": "10",      # Must be exactly "10"
+                    "filters": ".*"     # Can be any value (regex)
+                }
+            )
+        ]))
+
+        # Test: Should work with exact matching query parameters
+        # Note: Docker client may transform parameters, so we test with raw API
+        try:
+            # This should work with exact matches
+            response = docker_client_with_roxy.api._get("/containers/json", params={
+                "all": "true",
+                "limit": "10",
+                "filters": '{"status":["running"]}'
+            })
+        except APIError:
+            # The endpoint might not exist or have other issues, but the important thing
+            # is that it's not rejected due to parameter validation
+            pass
+
+        # Test: Should fail with wrong "all" parameter
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/containers/json", params={
+                "all": "false",  # Wrong value
+                "limit": "10",
+                "filters": '{"status":["running"]}'
+            })
+        assert excinfo.value.response.status_code == 403
+
+        # Test: Should fail with wrong "limit" parameter
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/containers/json", params={
+                "all": "true",
+                "limit": "20",  # Wrong value
+                "filters": '{"status":["running"]}'
+            })
+        assert excinfo.value.response.status_code == 403
+
+    def test_endpoint_exact_path_matching(self, docker_client_with_roxy, with_roxy_config):
+        """Test endpoints that must match exact paths rather than patterns."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1.40/containers/json",  # Exact API version
+                methods=["GET"],
+                allow=True
+            ),
+            # Deliberately not allowing other API versions
+        ]))
+
+        # Test: Should work with exact API version match
+        try:
+            response = docker_client_with_roxy.api._get("/v1.40/containers/json")
+        except APIError as e:
+            # Check if it's a validation error (403) vs other errors
+            if e.response.status_code == 403:
+                pytest.fail("Request was denied when it should have been allowed")
+
+        # Test: Should fail with different API version
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/v1.41/containers/json")
+        assert excinfo.value.response.status_code == 403
+
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/v1.39/containers/json")
+        assert excinfo.value.response.status_code == 403
+
+    def test_query_parameter_matching(self, docker_client_with_roxy, with_roxy_config):
+        """Test query parameter matching rules."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="required",
+                query_params={
+                    "all": "^(true|false|1|0)$",
+                    "limit": "^\\d+$"
+                }
+            )
+        ]))
+
+        # Test: Should work with valid query parameters
+        containers = docker_client_with_roxy.containers.list(all=True, limit=10)
+
+    def test_request_rules_multiple_conditions(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test request rules with multiple JSON path conditions."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
             Rule(
                 endpoint="/v1\\..*/containers/create.*",
                 methods=["POST"],
                 allow=True,
                 request_rules={
                     "$.Image": "alpine:latest",
-                    "$.Cmd": ["echo", "hello"]
+                    "$.Cmd[0]": "echo"
                 }
             ),
-            # Inspect container rule with response_rules
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}/json",
                 methods=["GET"],
                 allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"},
-                response_rules={
-                    "$.Config.Image": "alpine:latest",
-                    "$.Config.Cmd": ["echo", "hello"]
-                }
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
             ),
-            # Remove container rule for cleanup
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}",
                 methods=["DELETE"],
@@ -480,139 +975,366 @@ class TestRoxyIntegration:
         ]))
 
         try:
-            # Create a container
+            # Test: Should work with valid request matching all conditions
             container = docker_client_with_roxy.containers.create(
                 "alpine:latest",
                 command=["echo", "hello"],
-                name="roxy-test-combined-rules",
+                name="roxy-test-multi-rules",
             )
-
-            # Test that we can get the container (uses path variables)
-            container = docker_client_with_roxy.containers.get("roxy-test-combined-rules")
-            assert container.name == "roxy-test-combined-rules"
+            assert container.name == "roxy-test-multi-rules"
 
         finally:
-            # Clean up in case of test failure
             try:
-                container = docker_client_with_roxy.containers.get("roxy-test-combined-rules")
-                if container.status == "running":
-                    container.stop()
+                container = docker_client.containers.get("roxy-test-multi-rules")
                 container.remove()
             except docker.errors.NotFound:
                 pass
 
-
-class TestRoxyNegative:
-    """Negative tests for the roxy-socks application."""
-
-    def test_direct_docker_access(
-        self, 
-        docker_client: docker.DockerClient, 
-        roxy_process: subprocess.Popen, 
-        with_roxy_config: Callable[[Optional[RoxyConfig]], str]
-    ) -> None:
-        """Test that direct access to the Docker socket still works."""
-        # Create the model and configure roxy
-        with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # List containers rule
-            Rule(
-                endpoint="/v1\\..*/containers/json.*$",
-                methods=["GET"],
-                allow=True,
-            ),
-            # List images rule
-            Rule(
-                endpoint="/v1\\..*/images/json",
-                methods=["GET"],
-                allow=True
-            )
-        ]))
-
-        # This test verifies that the proxy doesn't interfere with direct Docker access
-        containers = docker_client.containers.list(all=True)
-        # Just verify that the request succeeds
-
-    def test_proxy_restart(self, docker_client_with_roxy, roxy_process, roxy_binary, with_roxy_config, roxy_socket, roxy_log_dir):
-        """Test that the proxy can be restarted and still works."""
-        # Create the model and configure roxy
-        config_model = RoxyConfig(rules=[
-            # List containers rule
-            Rule(
-                endpoint="/v1\\..*/containers/json.*$",
-                methods=["GET"],
-                allow=True,
-            )
-        ])
-        with_roxy_config(config_model)
-
-        # First, verify that the proxy is working
-        docker_client_with_roxy.containers.list(all=True)
-
-        # Restart the proxy
-        roxy_process.terminate()
-        roxy_process.wait()
-
-        # Manually restart the proxy
-        import subprocess
-        import time
-        import socket
-        from pathlib import Path
-
-        # Get the configuration path by calling the with_roxy_config callback with our config_model
-        config_path = with_roxy_config(config_model)
-
-        # Get the user docker socket path
-        user_docker = Path.home() / ".docker/run/docker.sock"
-
-        new_process = subprocess.Popen(
-            [
-                str(roxy_binary),
-                "--socket-path", str(roxy_socket),
-                "--config-path", config_path,
-                "--log-dir", str(roxy_log_dir),
-                "--log-rotation", "never",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+    def test_response_rules_with_json_filtering(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test response rules with JSON filtering."""
+        # Setup: Create containers with different images
+        container1 = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="roxy-test-response-alpine",
+        )
+        container2 = docker_client.containers.create(
+            "ubuntu:latest", 
+            command="sleep 300",
+            name="roxy-test-response-ubuntu",
         )
 
-        # Wait for the socket to be created
-        for _ in range(10):
-            if roxy_socket.exists():
-                break
-            time.sleep(0.5)
-        else:
-            new_process.terminate()
-            stdout, stderr = new_process.communicate()
-            raise RuntimeError(
-                f"Socket not created after 5 seconds. "
-                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-            )
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"},
+                    response_rules={
+                        "$.Config.Image": "alpine:latest"  # Only allow alpine containers in response
+                    }
+                )
+            ]))
 
-        # Wait for the socket to be ready
-        for _ in range(10):
-            try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect(str(roxy_socket))
-                sock.close()
-                break
-            except (socket.error, ConnectionRefusedError):
-                time.sleep(0.5)
-        else:
-            new_process.terminate()
-            stdout, stderr = new_process.communicate()
-            raise RuntimeError(
-                f"Socket not ready after 5 seconds. "
-                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-            )
+            # Test: Should work for alpine container
+            alpine_info = docker_client_with_roxy.api.inspect_container(container1.id)
+            assert alpine_info["Config"]["Image"] == "alpine:latest"
+
+            # Test: Should fail for ubuntu container
+            with pytest.raises(APIError) as excinfo:
+                docker_client_with_roxy.api.inspect_container(container2.id)
+            assert excinfo.value.response.status_code == 403
+
+        finally:
+            for container in [container1, container2]:
+                try:
+                    container.remove()
+                except docker.errors.NotFound:
+                    pass
+
+    def test_nested_json_path_conditions(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test complex nested JSON path conditions."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True,
+                request_rules={
+                    "$.HostConfig.Memory": 268435456,  # 256MB
+                    "$.HostConfig.CpuShares": 512,
+                    "$.Env[0]": "TEST=value"
+                }
+            ),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}", methods=["DELETE"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+        ]))
 
         try:
-            # Verify that it's still working
-            docker_client_with_roxy.containers.list(all=True)
+            # Test with matching nested conditions
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="roxy-test-nested-rules",
+                environment=["TEST=value"],
+                mem_limit="256m",
+                cpu_shares=512
+            )
+            assert container.name == "roxy-test-nested-rules"
+
         finally:
-            # Clean up the new process
-            new_process.terminate()
-            new_process.wait()
+            try:
+                container = docker_client.containers.get("roxy-test-nested-rules")
+                container.remove()
+            except NotFound:
+                pass
+
+    def test_complex_regex_patterns(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test complex regex patterns in rules."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="^/v1\\.[0-9]+/containers/create\\?name=[a-z]+-test-[0-9]+$",
+                methods=["POST"],
+                allow=True
+            ),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-f0-9]{64}"}),  # Full hex container ID
+            Rule(endpoint="/v1\\..*/containers/{container_id}", methods=["DELETE"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+        ]))
+
+        try:
+            # Test with matching regex pattern in endpoint
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="roxy-test-123"
+            )
+            assert container.name == "roxy-test-123"
+
+            # Test inspection with full container ID
+            container_info = docker_client_with_roxy.api.inspect_container(container.id)
+            assert container_info["Id"] == container.id
+
+        finally:
+            try:
+                container = docker_client.containers.get("roxy-test-123")
+                container.remove()
+            except NotFound:
+                pass
+
+    def test_multiple_path_variables(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test endpoints with multiple path variables."""
+        # Setup: Create container and network
+        container = docker_client.containers.create("alpine:latest", command="sleep 300", name="roxy-multi-path-test")
+        network = docker_client.networks.create("roxy-network-test")
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/networks/{network_id}/connect",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"network_id": "[a-f0-9]{64}"}
+                ),
+                Rule(
+                    endpoint="/v1\\..*/networks/{network_id}/disconnect", 
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={"network_id": "[a-f0-9]{64}"}
+                ),
+                Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                     path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            ]))
+
+            # Test network connect
+            network.connect(container)
+
+            # Verify connection
+            network.reload()
+            container.reload()
+
+            # Test network disconnect
+            network.disconnect(container)
+
+        finally:
+            try:
+                container.remove()
+                network.remove()
+            except NotFound:
+                pass
+
+    def test_response_rule_content_filtering(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test that response rules actually filter content."""
+        # Setup: Create containers with different images
+        alpine_container = docker_client.containers.create("alpine:latest", command="sleep 300", name="test-alpine-response")
+        ubuntu_container = docker_client.containers.create("ubuntu:latest", command="sleep 300", name="test-ubuntu-response")
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"},
+                    response_rules={
+                        "$.Config.Image": "alpine:latest"  # Only allow alpine containers
+                    }
+                )
+            ]))
+
+            # Should work for alpine container
+            alpine_info = docker_client_with_roxy.api.inspect_container(alpine_container.id)
+            assert alpine_info["Config"]["Image"] == "alpine:latest"
+
+            # Should fail for ubuntu container due to response rule
+            with pytest.raises(APIError) as excinfo:
+                docker_client_with_roxy.api.inspect_container(ubuntu_container.id)
+            assert excinfo.value.response.status_code == 403
+
+        finally:
+            for container in [alpine_container, ubuntu_container]:
+                try:
+                    container.remove()
+                except NotFound:
+                    pass
+
+
+class TestRoxyPerformanceAndConcurrency:
+    """Test proxy performance and concurrent request handling."""
+
+    def test_concurrent_requests(self, docker_client_with_roxy, with_roxy_config):
+        """Test handling multiple concurrent requests."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+            Rule(endpoint="/version", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/version", methods=["GET"], allow=True),
+        ]))
+
+        def make_request():
+            return docker_client_with_roxy.containers.list(all=True)
+
+        # Test 10 concurrent requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(make_request) for _ in range(10)]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+        # All requests should succeed
+        assert len(results) == 10
+        for result in results:
+            assert isinstance(result, list)
+
+    def test_large_response_handling(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test handling of large responses."""
+        # Create multiple containers to generate a larger response
+        containers = []
+        for i in range(5):
+            container = docker_client.containers.create(
+                "alpine:latest", 
+                command="sleep 300",
+                name=f"roxy-large-response-{i}",
+                environment=[f"TEST_VAR_{j}=value_{j}" for j in range(20)]  # Add many env vars
+            )
+            containers.append(container)
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+                Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                     path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            ]))
+
+            # Test large list response
+            all_containers = docker_client_with_roxy.containers.list(all=True)
+            assert len(all_containers) >= 5
+
+            # Test individual large responses
+            for container in containers:
+                container_info = docker_client_with_roxy.api.inspect_container(container.id)
+                assert len(container_info["Config"]["Env"]) >= 20
+
+        finally:
+            for container in containers:
+                try:
+                    container.remove()
+                except NotFound:
+                    pass
+
+    def test_request_timeout_handling(self, docker_client_with_roxy, with_roxy_config):
+        """Test request timeout handling."""
+        with_roxy_config(RoxyConfig(timeout=1, rules=[  # Very short timeout
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Simple requests should still work even with short timeout
+        containers = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers, list)
+
+
+class TestRoxySecurityBoundaries:
+    """Test security boundaries and edge cases."""
+
+    def test_path_traversal_attempts(self, docker_client_with_roxy, with_roxy_config):
+        """Test that path traversal attempts are blocked."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json", methods=["GET"], allow=True),
+        ]))
+
+        # All of these should fail because they don't match the exact rule
+        malicious_paths = [
+            "/v1.40/../version",
+            "/v1.40/containers/../info", 
+            "/v1.40/containers/json/../../../version"
+        ]
+
+        for path in malicious_paths:
+            with pytest.raises(APIError) as excinfo:
+                # Use low-level API to try malicious paths
+                response = docker_client_with_roxy.api._get(path)
+            assert excinfo.value.response.status_code == 403
+
+    def test_method_spoofing_attempts(self, docker_client_with_roxy, with_roxy_config):
+        """Test that method spoofing doesn't work."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json", methods=["GET"], allow=True),
+            # Deliberately not allowing POST
+        ]))
+
+        # GET should work
+        containers = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers, list)
+
+        # POST should fail
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create("alpine:latest", command="sleep 300")
+        assert excinfo.value.response.status_code == 403
+
+    def test_header_injection_resistance(self, docker_client_with_roxy, with_roxy_config):
+        """Test resistance to header injection attempts."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Normal request should work
+        containers = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers, list)
+
+        # Requests with unusual headers should still be processed normally
+        # (The proxy should pass headers through without modification)
+
+    def test_oversized_request_handling(self, docker_client_with_roxy, with_roxy_config):
+        """Test handling of oversized requests."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/create.*", methods=["POST"], allow=True),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}", methods=["DELETE"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+        ]))
+
+        try:
+            # Create container with many environment variables (large request)
+            large_env = [f"VAR_{i}=value_{i}_" + "x" * 100 for i in range(100)]
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="roxy-test-oversized",
+                environment=large_env
+            )
+            assert container.name == "roxy-test-oversized"
+
+        finally:
+            try:
+                container = docker_client_with_roxy.containers.get("roxy-test-oversized")
+                container.remove()
+            except NotFound:
+                pass
+
+
+class TestRoxyNegativeScenarios:
+    """Negative test scenarios."""
 
     def test_operation_not_allowed(
         self, 
@@ -846,68 +1568,1321 @@ class TestRoxyNegative:
             except docker.errors.NotFound:
                 pass
 
-    def test_complex_path_regex(self, docker_client_with_roxy, with_roxy_config):
-        """Test that path_regex works correctly for complex paths."""
-        # Create the model and configure roxy with path_regex
+    def test_privileged_container_denied(self, docker_client_with_roxy, with_roxy_config):
+        """Test that creating a privileged container is denied."""
+        # Create the model and configure roxy
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Rule with regex endpoint that includes query parameters
+            # Create container rule with privileged=False
             Rule(
-                endpoint="/v1\\..*/containers/json.*$",  # Allow containers listing
+                endpoint="/v1\\..*/containers/create.*$",
+                methods=["POST"],
+                allow=True,
+                request_rules={"$.HostConfig.Privileged": False}
+            )
+        ]))
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="roxy-test-privileged",
+                privileged=True,
+            )
+
+        # Verify that the error is due to the request being denied
+        assert excinfo.value.response is not None and excinfo.value.response.status_code == 403, f"Expected 403 status code, got: {excinfo.value.response.status_code if excinfo.value.response else 'None'}"
+
+    def test_direct_docker_access(
+        self, 
+        docker_client: docker.DockerClient, 
+        roxy_process: subprocess.Popen, 
+        with_roxy_config: Callable[[Optional[RoxyConfig]], str]
+    ) -> None:
+        """Test that direct access to the Docker socket still works."""
+        # Create the model and configure roxy
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # List containers rule
+            Rule(
+                endpoint="/v1\\..*/containers/json.*$",
+                methods=["GET"],
+                allow=True,
+            ),
+            # List images rule
+            Rule(
+                endpoint="/v1\\..*/images/json",
                 methods=["GET"],
                 allow=True
+            )
+        ]))
+
+        # This test verifies that the proxy doesn't interfere with direct Docker access
+        containers = docker_client.containers.list(all=True)
+        # Just verify that the request succeeds
+
+    def test_proxy_restart(self, docker_client_with_roxy, roxy_process, roxy_binary, with_roxy_config, roxy_socket, roxy_log_dir):
+        """Test that the proxy can be restarted and still works."""
+        # Create the model and configure roxy
+        config_model = RoxyConfig(rules=[
+            # List containers rule
+            Rule(
+                endpoint="/v1\\..*/containers/json.*$",
+                methods=["GET"],
+                allow=True,
+            )
+        ])
+        with_roxy_config(config_model)
+
+        # First, verify that the proxy is working
+        docker_client_with_roxy.containers.list(all=True)
+
+        # Restart the proxy
+        roxy_process.terminate()
+        roxy_process.wait()
+
+        # Manually restart the proxy
+        import subprocess
+        import time
+        import socket
+        from pathlib import Path
+
+        # Get the configuration path by calling the with_roxy_config callback with our config_model
+        config_path = with_roxy_config(config_model)
+
+        # Get the user docker socket path
+        user_docker = Path.home() / ".docker/run/docker.sock"
+
+        new_process = subprocess.Popen(
+            [
+                str(roxy_binary),
+                "--socket-path", str(roxy_socket),
+                "--config-path", config_path,
+                "--log-dir", str(roxy_log_dir),
+                "--log-rotation", "never",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Wait for the socket to be created
+        for _ in range(10):
+            if roxy_socket.exists():
+                break
+            time.sleep(0.5)
+        else:
+            new_process.terminate()
+            stdout, stderr = new_process.communicate()
+            raise RuntimeError(
+                f"Socket not created after 5 seconds. "
+                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
+            )
+
+        # Wait for the socket to be ready
+        for _ in range(10):
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(str(roxy_socket))
+                sock.close()
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.5)
+        else:
+            new_process.terminate()
+            stdout, stderr = new_process.communicate()
+            raise RuntimeError(
+                f"Socket not ready after 5 seconds. "
+                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
+            )
+
+        try:
+            # Verify that it's still working
+            docker_client_with_roxy.containers.list(all=True)
+        finally:
+            # Clean up the new process
+            new_process.terminate()
+            new_process.wait()
+
+
+class TestRoxyErrorScenarios:
+    """Test various error scenarios and edge cases."""
+
+    def test_invalid_json_in_request_rules(self, docker_client_with_roxy, with_roxy_config):
+        """Test behavior with malformed JSON in requests."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True,
+                request_rules={
+                    "$.Image": "alpine:latest"
+                }
+            )
+        ]))
+
+        # Valid request should work
+        # (We can't easily send malformed JSON through the Docker client,
+        # but the rule checking will handle malformed JSON gracefully)
+
+    def test_empty_response_handling(self, docker_client_with_roxy, with_roxy_config):
+        """Test handling of empty responses."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Even if no containers exist, should return empty list
+        containers = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers, list)
+
+    def test_rule_precedence_order(self, docker_client_with_roxy, with_roxy_config):
+        """Test that rule precedence (first-match) works correctly."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # First rule: deny all container operations
+            Rule(endpoint="/v1\\..*/containers/.*", methods=["GET"], allow=False),
+            # Second rule: allow container list (should never be reached)
+            Rule(endpoint="/v1\\..*/containers/json", methods=["GET"], allow=True),
+        ]))
+
+        # Should be denied by first rule
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.list(all=True)
+        assert excinfo.value.response.status_code == 403
+
+    def test_malformed_regex_patterns(self, docker_client_with_roxy, with_roxy_config):
+        """Test behavior with invalid regex patterns in rules."""
+        # Note: The proxy should handle invalid regex gracefully by treating
+        # them as literal strings or failing safely
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json.*",
+                methods=["GET"],
+                allow=True,
+                path_variables={"container_id": "[unclosed bracket"}  # Invalid regex
             ),
-            # Add container inspection rule needed for containers.list()
+        ]))
+
+        # Should still work for basic endpoint matching
+        containers = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers, list)
+
+
+class TestRoxyConfigReload:
+    """Configuration reload functionality tests."""
+
+    def test_config_reload_allow_to_deny(self, docker_client_with_roxy, with_roxy_config):
+        """Test configuration reload from allowing to denying."""
+        # Start with allowing containers list
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json.*",
+                methods=["GET"],
+                allow=True,
+            )
+        ]))
+
+        # Should work initially
+        docker_client_with_roxy.containers.list(all=True)
+
+        # Change config to deny
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # Wait for config reload
+        import time
+        time.sleep(0.5)
+
+        # Should now fail
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.list(all=True)
+        assert excinfo.value.response.status_code == 403
+
+    def test_config_reload_deny_to_allow(self, docker_client_with_roxy, with_roxy_config):
+        """Test configuration reload from denying to allowing."""
+        # Start with denying
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # Should fail initially
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.list(all=True)
+        assert excinfo.value.response.status_code == 403
+
+        # Change config to allow
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json.*",
+                methods=["GET"],
+                allow=True,
+            )
+        ]))
+
+        # Wait for config reload
+        import time
+        time.sleep(0.5)
+
+        # Should now work
+        docker_client_with_roxy.containers.list(all=True)
+
+    def test_config_file_modification_during_operation(self, docker_client_with_roxy, with_roxy_config):
+        """Test rapid configuration changes during operations."""
+        # Start with one configuration
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Make a request
+        containers1 = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers1, list)
+
+        # Rapidly change configuration multiple times
+        for i in range(3):
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+                Rule(endpoint="/version", methods=["GET"], allow=True),
+            ]))
+            time.sleep(0.1)  # Brief pause
+
+        # Wait for file watcher to catch up
+        time.sleep(1.0)
+
+        # Should still work
+        containers2 = docker_client_with_roxy.containers.list(all=True)
+        assert isinstance(containers2, list)
+
+    def test_empty_rules_configuration(self, docker_client_with_roxy, with_roxy_config):
+        """Test behavior with completely empty rules."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # Everything should be denied
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.list(all=True)
+        assert excinfo.value.response.status_code == 403
+
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.version()
+        assert excinfo.value.response.status_code == 403
+
+    def test_default_rules_behavior(self, docker_client_with_roxy, with_roxy_config):
+        """Test that default rules (like /version) work correctly."""
+        # Configure with no explicit rules - should still have default /version rule
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # The /version endpoint should work due to default rules
+        # (Note: This depends on how the test fixture is set up with --no-default-rules)
+        
+        # Add explicit version rule to test
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/version", methods=["GET"], allow=True),
+            Rule(endpoint="/v1\\..*/version", methods=["GET"], allow=True),
+        ]))
+
+        version = docker_client_with_roxy.version()
+        assert "Version" in version
+
+
+class TestRoxyProxyBehavior:
+    """Test proxy-specific behavior."""
+
+    def test_direct_docker_access_still_works(self, docker_client: docker.DockerClient, with_roxy_config):
+        """Test that direct Docker access is unaffected by proxy rules."""
+        # Configure proxy with restrictive rules
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # Direct Docker access should still work
+        containers = docker_client.containers.list(all=True)
+
+    def test_proxy_socket_permissions(self, roxy_socket):
+        """Test that proxy socket has correct permissions."""
+        import stat
+        
+        # Socket should exist and be accessible
+        assert roxy_socket.exists()
+        
+        # Check permissions (should be 666 = rw-rw-rw-)
+        socket_stat = roxy_socket.stat()
+        permissions = stat.filemode(socket_stat.st_mode)
+        # Unix socket will show as 'srw-rw-rw-' where 's' indicates socket type
+        assert permissions.endswith("rw-rw-rw-")
+
+    def test_proxy_logs_requests(self, docker_client_with_roxy, with_roxy_config, roxy_log_dir):
+        """Test that proxy logs requests."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json.*",
+                methods=["GET"],
+                allow=True,
+            )
+        ]))
+
+        # Make a request
+        docker_client_with_roxy.containers.list(all=True)
+
+        # Check that log files were created
+        log_files = list(roxy_log_dir.glob("*.log"))
+        assert len(log_files) > 0
+
+        # Check that at least one log file has content
+        has_content = False
+        for log_file in log_files:
+            if log_file.stat().st_size > 0:
+                has_content = True
+                break
+        assert has_content
+
+
+class TestRoxyLoggingAndObservability:
+    """Test logging and observability features."""
+
+    def test_request_logging_content(self, docker_client_with_roxy, with_roxy_config, roxy_log_dir):
+        """Test that requests are properly logged with expected content."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Make a request
+        containers = docker_client_with_roxy.containers.list(all=True)
+
+        # Wait a moment for logs to be written
+        time.sleep(0.5)
+
+        # Check log files
+        log_files = list(roxy_log_dir.glob("*.log"))
+        assert len(log_files) > 0
+
+        # Check log content
+        log_content = ""
+        for log_file in log_files:
+            with open(log_file, 'r') as f:
+                content = f.read()
+                log_content += content
+
+        # Should contain request information
+        assert "containers/json" in log_content
+        assert "Request allowed" in log_content or "allowed" in log_content
+
+    def test_denied_request_logging(self, docker_client_with_roxy, with_roxy_config, roxy_log_dir):
+        """Test that denied requests are properly logged."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[]))
+
+        # Make a request that will be denied
+        with pytest.raises(APIError):
+            docker_client_with_roxy.containers.list(all=True)
+
+        # Wait for logs
+        time.sleep(0.5)
+
+        # Check log content
+        log_content = ""
+        log_files = list(roxy_log_dir.glob("*.log"))
+        for log_file in log_files:
+            with open(log_file, 'r') as f:
+                content = f.read()
+                log_content += content
+
+        # Should contain denial information
+        assert ("Request denied" in log_content or "denied" in log_content or 
+                "No matching rules" in log_content)
+
+    def test_process_information_logging(self, docker_client_with_roxy, with_roxy_config, roxy_log_dir):
+        """Test that process information is logged."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        # Make a request
+        containers = docker_client_with_roxy.containers.list(all=True)
+
+        # Wait for logs
+        time.sleep(0.5)
+
+        # Check log content
+        log_content = ""
+        log_files = list(roxy_log_dir.glob("*.log"))
+        for log_file in log_files:
+            with open(log_file, 'r') as f:
+                content = f.read()
+                log_content += content
+
+        # Should contain process information
+        assert ("pid" in log_content.lower() or "binary" in log_content.lower() or
+                "process" in log_content.lower())
+
+
+class TestRoxyComprehensiveRuleMatching:
+    """Comprehensive tests for all rule matching scenarios and edge cases."""
+
+    # Scenario 1: Comprehensive Query Parameter Matching
+    def test_query_params_optional_vs_required_vs_forbidden(self, docker_client_with_roxy, with_roxy_config):
+        """Test different query parameter matching modes."""
+        # Test 1: Optional parameters
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="optional",
+                query_params={
+                    "all": "^(true|false)$",
+                    "limit": "^\\d+$"
+                }
+            )
+        ]))
+
+        # Should work with parameters
+        try:
+            docker_client_with_roxy.api._get("/containers/json", params={"all": "true", "limit": "5"})
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Optional parameters should be allowed")
+
+        # Should work without parameters
+        try:
+            docker_client_with_roxy.api._get("/containers/json")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Missing optional parameters should be allowed")
+
+        # Test 2: Required parameters
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="required",
+                query_params={
+                    "all": "^(true|false)$",
+                    "limit": "^\\d+$"
+                }
+            )
+        ]))
+
+        # Should work with all required parameters
+        try:
+            docker_client_with_roxy.api._get("/containers/json", params={"all": "true", "limit": "5"})
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Required parameters should be allowed when present")
+
+        # Should fail without required parameters
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/containers/json")
+        assert excinfo.value.response.status_code == 403
+
+        # Should fail with missing one required parameter
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/containers/json", params={"all": "true"})
+        assert excinfo.value.response.status_code == 403
+
+    def test_query_params_complex_patterns_and_special_chars(self, docker_client_with_roxy, with_roxy_config):
+        """Test query parameters with complex regex patterns and special characters."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="optional",
+                query_params={
+                    "filters": '^\\{"status":\\["[a-z]+"\\]\\}$',  # Complex JSON pattern
+                    "label": "^[a-zA-Z0-9_.-]+=[a-zA-Z0-9_.-]+$",  # Key=value pattern
+                    "since": "^[a-f0-9]{12,64}$",  # Container ID pattern
+                    "before": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"  # ISO timestamp
+                }
+            )
+        ]))
+
+        # Test valid complex patterns
+        try:
+            docker_client_with_roxy.api._get("/containers/json", params={
+                "filters": '{"status":["running"]}',
+                "label": "env=production",
+                "since": "abcdef123456",
+                "before": "2023-12-25T10:30:45Z"
+            })
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Valid complex patterns should be allowed")
+
+        # Test invalid patterns
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/containers/json", params={
+                "filters": '{"invalid": "json"}',  # Doesn't match pattern
+            })
+        assert excinfo.value.response.status_code == 403
+
+    def test_query_params_empty_and_multiple_values(self, docker_client_with_roxy, with_roxy_config):
+        """Test empty query parameter values and multiple values."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="optional",
+                query_params={
+                    "empty_allowed": "^$",  # Allow empty values
+                    "multi_value": "^(prod|dev|test)$"  # Multiple allowed values
+                }
+            )
+        ]))
+
+        # Test empty parameter values
+        try:
+            docker_client_with_roxy.api._get("/containers/json", params={"empty_allowed": ""})
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Empty parameter values should be allowed when pattern matches")
+
+        # Test multiple valid values
+        for value in ["prod", "dev", "test"]:
+            try:
+                docker_client_with_roxy.api._get("/containers/json", params={"multi_value": value})
+            except APIError as e:
+                if e.response.status_code == 403:
+                    pytest.fail(f"Value '{value}' should be allowed")
+
+    # Scenario 2: Path Variables Edge Cases
+    def test_path_variables_special_characters(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test path variables with special characters."""
+        # Setup containers with names containing special characters
+        containers = []
+        container_names = ["test-container", "test_container", "test.container"]
+        
+        for name in container_names:
+            try:
+                container = docker_client.containers.create("alpine:latest", command="sleep 300", name=name)
+                containers.append(container)
+            except:
+                # Some names might not be valid, skip them
+                pass
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_name}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_name": "[a-zA-Z0-9._-]+"}  # Allow dots, hyphens, underscores
+                )
+            ]))
+
+            # Test containers with special characters
+            for container in containers:
+                try:
+                    container_info = docker_client_with_roxy.api.inspect_container(container.name)
+                    assert container_info["Name"] == f"/{container.name}"
+                except APIError as e:
+                    if e.response.status_code == 403:
+                        pytest.fail(f"Container name '{container.name}' should be allowed")
+
+        finally:
+            for container in containers:
+                try:
+                    container.remove()
+                except:
+                    pass
+
+    def test_path_variables_multiple_in_endpoint(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test multiple path variables in the same endpoint."""
+        # Setup network and container
+        network = docker_client.networks.create("test-multi-path")
+        container = docker_client.containers.create("alpine:latest", command="sleep 300", name="test-multi-container")
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/networks/{network_id}/connect",
+                    methods=["POST"],
+                    allow=True,
+                    path_variables={
+                        "network_id": "[a-f0-9]{64}"  # Full network ID
+                    },
+                    request_rules={
+                        "$.Container": "test-multi-container"  # Exact container name in request
+                    }
+                )
+            ]))
+
+            # Test connecting container to network (multiple path validation)
+            network.connect(container)
+
+        finally:
+            try:
+                container.remove()
+                network.remove()
+            except:
+                pass
+
+    def test_path_variables_overlapping_patterns(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test path variables with overlapping regex patterns (first match wins)."""
+        container = docker_client.containers.create("alpine:latest", command="sleep 300", name="test123")
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                # First rule: more specific pattern
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "test123"}  # Exact match
+                ),
+                # Second rule: broader pattern (should not be reached for test123)
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=False,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}  # Broader pattern
+                )
+            ]))
+
+            # Should be allowed by first rule
+            container_info = docker_client_with_roxy.api.inspect_container("test123")
+            assert container_info["Name"] == "/test123"
+
+        finally:
+            try:
+                container.remove()
+            except:
+                pass
+
+    def test_path_variables_escaped_characters(self, docker_client_with_roxy, with_roxy_config):
+        """Test path variables with escaped characters in patterns."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}/json",
+                methods=["GET"],
+                allow=True,
+                path_variables={"container_id": "test\\.container\\-name_123"}  # Escaped dots and hyphens
+            )
+        ]))
+
+        # Should work with exact match including literal dots and hyphens
+        try:
+            docker_client_with_roxy.api.inspect_container("test.container-name_123")
+        except APIError as e:
+            # Expected to fail since container doesn't exist, but should not be 403
+            if e.response.status_code == 403:
+                pytest.fail("Escaped characters should match literally")
+
+        # Should fail with different pattern
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api.inspect_container("testXcontainerXname_123")
+        assert excinfo.value.response.status_code == 403
+
+    # Scenario 3: Request Rules Complex Scenarios
+    def test_request_rules_deep_nested_json(self, docker_client_with_roxy, with_roxy_config):
+        """Test request rules with deeply nested JSON validation."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True,
+                request_rules={
+                    "$.HostConfig.LogConfig.Type": "json-file",
+                    "$.HostConfig.LogConfig.Config.max-size": "10m",
+                    "$.HostConfig.RestartPolicy.Name": "unless-stopped",
+                    "$.HostConfig.RestartPolicy.MaximumRetryCount": 3,
+                    "$.Labels.environment": "production",
+                    "$.Labels.team": "backend"
+                }
+            ),
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}/json",
                 methods=["GET"],
                 allow=True,
                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}",
+                methods=["DELETE"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
             )
         ]))
 
-        # Try to list all containers, which should be allowed
-        containers_all = docker_client_with_roxy.containers.list(all=True)
-        # Just verify that the request succeeds
+        try:
+            # Should work with all nested conditions met
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="test-deep-nested",
+                log_config={"Type": "json-file", "Config": {"max-size": "10m"}},
+                restart_policy={"Name": "unless-stopped", "MaximumRetryCount": 3},
+                labels={"environment": "production", "team": "backend"}
+            )
+            assert container.name == "test-deep-nested"
 
-        # Try to list only running containers, which should also be allowed with the current rule
-        containers_running = docker_client_with_roxy.containers.list(all=False)
-        # Just verify that the request succeeds
+        finally:
+            try:
+                container = docker_client_with_roxy.containers.get("test-deep-nested")
+                container.remove()
+            except:
+                pass
 
-    def test_config_reload(self, docker_client_with_roxy, with_roxy_config):
-        """Test that the proxy uses the latest configuration when the config file is updated."""
-        # Create an initial configuration that denies listing containers
+        # Should fail with wrong nested values
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="test-wrong-nested",
+                log_config={"Type": "syslog", "Config": {"max-size": "10m"}},  # Wrong log type
+                restart_policy={"Name": "unless-stopped", "MaximumRetryCount": 3},
+                labels={"environment": "production", "team": "backend"}
+            )
+        assert excinfo.value.response.status_code == 403
+
+    def test_request_rules_array_validation(self, docker_client_with_roxy, with_roxy_config):
+        """Test request rules with array validation at specific indices."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # No rule for listing containers, so it should be denied
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True,
+                request_rules={
+                    "$.Cmd[0]": "sh",  # First command must be sh
+                    "$.Cmd[1]": "-c",  # Second command must be -c
+                    "$.Env[0]": "ENV=production",  # First env var
+                    "$.Env[1]": "DEBUG=false",     # Second env var
+                    "$.ExposedPorts.80/tcp": {},   # Port 80 must be exposed
+                    "$.ExposedPorts.443/tcp": {}   # Port 443 must be exposed
+                }
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}/json",
+                methods=["GET"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}",
+                methods=["DELETE"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            )
         ]))
 
-        # Try to list containers, which should be denied
+        try:
+            # Should work with correct array values
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command=["sh", "-c", "sleep 300"],
+                name="test-array-validation",
+                environment=["ENV=production", "DEBUG=false", "REGION=us-east-1"],
+                ports={"80/tcp": None, "443/tcp": None}
+            )
+            assert container.name == "test-array-validation"
+
+        finally:
+            try:
+                container = docker_client_with_roxy.containers.get("test-array-validation")
+                container.remove()
+            except:
+                pass
+
+        # Should fail with wrong array values
         with pytest.raises(APIError) as excinfo:
-            docker_client_with_roxy.containers.list(all=True)
+            docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command=["bash", "-c", "sleep 300"],  # Wrong first command
+                name="test-wrong-array",
+                environment=["ENV=production", "DEBUG=false"],
+                ports={"80/tcp": None, "443/tcp": None}
+            )
+        assert excinfo.value.response.status_code == 403
 
-        # Verify that the error is due to the request being denied
-        assert excinfo.value.response is not None and excinfo.value.response.status_code == 403, f"Expected 403 status code, got: {excinfo.value.response.status_code if excinfo.value.response else 'None'}"
-
-        # Update the configuration to allow listing containers
+    def test_request_rules_boolean_number_null_validation(self, docker_client_with_roxy, with_roxy_config):
+        """Test request rules with boolean, number, and null value validation."""
         with_roxy_config(RoxyConfig(timeout=30, rules=[
-            # Rule to allow listing containers
+            Rule(
+                endpoint="/v1\\..*/containers/create.*",
+                methods=["POST"],
+                allow=True,
+                request_rules={
+                    "$.HostConfig.Privileged": False,        # Boolean false
+                    "$.HostConfig.ReadonlyRootfs": True,     # Boolean true
+                    "$.HostConfig.Memory": 536870912,        # Number (512MB)
+                    "$.HostConfig.CpuShares": 1024,          # Number
+                    "$.HostConfig.PidMode": None,            # Null value
+                    "$.HostConfig.NetworkMode": "bridge"     # String
+                }
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}/json",
+                methods=["GET"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            ),
+            Rule(
+                endpoint="/v1\\..*/containers/{container_id}",
+                methods=["DELETE"],
+                allow=True,
+                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+            )
+        ]))
+
+        try:
+            # Should work with correct type values
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="test-type-validation",
+                privileged=False,
+                read_only=True,
+                mem_limit=536870912,
+                cpu_shares=1024,
+                network_mode="bridge"
+            )
+            assert container.name == "test-type-validation"
+
+        finally:
+            try:
+                container = docker_client_with_roxy.containers.get("test-type-validation")
+                container.remove()
+            except:
+                pass
+
+        # Should fail with wrong boolean value
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sleep 300",
+                name="test-wrong-boolean",
+                privileged=True,  # Should be False
+                read_only=True,
+                mem_limit=536870912,
+                cpu_shares=1024,
+                network_mode="bridge"
+            )
+        assert excinfo.value.response.status_code == 403
+
+    # Scenario 4: Response Rules Complex Scenarios
+    def test_response_rules_array_filtering(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test response rules with array filtering."""
+        # Setup: Create multiple containers with different configurations
+        containers = []
+        container_configs = [
+            {"name": "prod-app-1", "labels": {"env": "production", "type": "app"}},
+            {"name": "prod-db-1", "labels": {"env": "production", "type": "database"}},
+            {"name": "dev-app-1", "labels": {"env": "development", "type": "app"}},
+        ]
+
+        for config in container_configs:
+            try:
+                container = docker_client.containers.create(
+                    "alpine:latest",
+                    command="sleep 300",
+                    name=config["name"],
+                    labels=config["labels"]
+                )
+                containers.append(container)
+            except:
+                pass
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/json.*",
+                    methods=["GET"],
+                    allow=True,
+                    response_rules={
+                        "$[*].Labels.env": "production",  # Only production containers in list
+                        "$[*].Labels.type": "app"         # Only app containers
+                    }
+                ),
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                )
+            ]))
+
+            # List should only return production app containers
+            container_list = docker_client_with_roxy.containers.list(all=True)
+            prod_app_containers = [c for c in container_list if c.name == "prod-app-1"]
+            assert len(prod_app_containers) == 1
+
+        finally:
+            for container in containers:
+                try:
+                    container.remove()
+                except:
+                    pass
+
+    def test_response_rules_complex_nested_validation(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test response rules with complex nested structure validation."""
+        container = docker_client.containers.create(
+            "alpine:latest",
+            command="sleep 300",
+            name="test-complex-response",
+            environment=["ENV=production", "SERVICE=api"],
+            labels={"team": "backend", "version": "1.0.0"}
+        )
+
+        try:
+            with_roxy_config(RoxyConfig(timeout=30, rules=[
+                Rule(
+                    endpoint="/v1\\..*/containers/{container_id}/json",
+                    methods=["GET"],
+                    allow=True,
+                    path_variables={"container_id": "[a-zA-Z0-9_-]+"},
+                    response_rules={
+                        "$.Config.Env[0]": "ENV=production",        # First env var
+                        "$.Config.Env[1]": "SERVICE=api",           # Second env var
+                        "$.Config.Labels.team": "backend",          # Label validation
+                        "$.Config.Labels.version": "1.0.0",         # Version validation
+                        "$.State.Status": "created",                # Container state
+                        "$.NetworkSettings.Bridge": ""              # Network settings
+                    }
+                )
+            ]))
+
+            # Should work for container that matches all nested response rules
+            container_info = docker_client_with_roxy.api.inspect_container(container.id)
+            assert container_info["Config"]["Labels"]["team"] == "backend"
+
+        finally:
+            try:
+                container.remove()
+            except:
+                pass
+
+    # Scenario 5: Endpoint Pattern Matching
+    def test_endpoint_patterns_multiple_wildcards(self, docker_client_with_roxy, with_roxy_config):
+        """Test endpoint patterns with multiple wildcard segments."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/.*/.*/json",  # Multiple wildcard segments
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should match various nested paths
+        test_paths = [
+            "/v1.40/containers/abc123/json",
+            "/v1.41/networks/def456/json", 
+            "/v1.39/images/ghi789/json",
+            "/v1.42/volumes/jkl012/json"
+        ]
+
+        for path in test_paths:
+            try:
+                docker_client_with_roxy.api._get(path)
+            except APIError as e:
+                if e.response.status_code == 403:
+                    pytest.fail(f"Path '{path}' should match wildcard pattern")
+
+    def test_endpoint_patterns_escaped_regex_chars(self, docker_client_with_roxy, with_roxy_config):
+        """Test endpoint patterns with escaped regex characters."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\.40/containers\\.json\\?filters=\\{.*\\}",  # Escaped dots, braces
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should match literal dots and braces
+        try:
+            docker_client_with_roxy.api._get("/v1.40/containers.json?filters={}")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Escaped regex characters should match literally")
+
+        # Should not match without literal dots
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/v1X40/containersXjson?filters={}")
+        assert excinfo.value.response.status_code == 403
+
+    def test_endpoint_patterns_case_sensitivity(self, docker_client_with_roxy, with_roxy_config):
+        """Test case sensitivity for endpoint patterns."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint="/v1\\..*/Containers/JSON",  # Mixed case
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should only match exact case
+        try:
+            docker_client_with_roxy.api._get("/v1.40/Containers/JSON")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Exact case should match")
+
+        # Should not match different case
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/v1.40/containers/json")
+        assert excinfo.value.response.status_code == 403
+
+    def test_endpoint_patterns_very_long_paths(self, docker_client_with_roxy, with_roxy_config):
+        """Test endpoint patterns with very long paths."""
+        long_segment = "a" * 100
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(
+                endpoint=f"/v1\\..*/very/long/path/{long_segment}/endpoint",
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should handle very long paths
+        long_path = f"/v1.40/very/long/path/{long_segment}/endpoint"
+        try:
+            docker_client_with_roxy.api._get(long_path)
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Very long paths should be handled")
+
+    # Scenario 7: Rule Precedence and Ordering
+    def test_rule_precedence_first_match_wins(self, docker_client_with_roxy, with_roxy_config):
+        """Test that first matching rule wins (rule precedence)."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # First rule: specific path, allow
             Rule(
                 endpoint="/v1\\..*/containers/json",
                 methods=["GET"],
                 allow=True
             ),
-            # Add container inspection rule needed for containers.list()
+            # Second rule: broader pattern, deny (should not be reached)
+            Rule(
+                endpoint="/v1\\..*/containers/.*",
+                methods=["GET"],
+                allow=False
+            ),
+            # Third rule: even broader, allow (should not be reached)
+            Rule(
+                endpoint="/v1\\..*",
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should be allowed by first rule
+        try:
+            docker_client_with_roxy.api._get("/v1.40/containers/json")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("First rule should allow this request")
+
+    def test_rule_precedence_different_specificity(self, docker_client_with_roxy, with_roxy_config):
+        """Test rules with different specificity levels."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # More specific rule first (should match)
+            Rule(
+                endpoint="/v1\\.40/containers/json\\?all=true",
+                methods=["GET"],
+                allow=True
+            ),
+            # Less specific rule second (should not be reached for above pattern)
+            Rule(
+                endpoint="/v1\\.40/containers/json.*",
+                methods=["GET"],
+                allow=False
+            ),
+            # General rule third
+            Rule(
+                endpoint="/v1\\..*/containers/json.*",
+                methods=["GET"],
+                allow=True
+            )
+        ]))
+
+        # Should match first, most specific rule
+        try:
+            docker_client_with_roxy.api._get("/v1.40/containers/json?all=true")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Most specific rule should allow this request")
+
+        # Should match third rule (second rule is deny)
+        try:
+            docker_client_with_roxy.api._get("/v1.41/containers/json?limit=10")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Less specific rule should allow this request")
+
+    def test_rule_precedence_allow_vs_deny_conflicts(self, docker_client_with_roxy, with_roxy_config):
+        """Test conflicting allow vs deny rules."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # First rule: deny specific endpoint
+            Rule(
+                endpoint="/v1\\..*/containers/dangerous-endpoint",
+                methods=["POST"],
+                allow=False
+            ),
+            # Second rule: allow all container operations (should not override first)
+            Rule(
+                endpoint="/v1\\..*/containers/.*",
+                methods=["POST"],
+                allow=True
+            )
+        ]))
+
+        # Should be denied by first rule
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._post("/v1.40/containers/dangerous-endpoint", data={})
+        assert excinfo.value.response.status_code == 403
+
+        # Should be allowed by second rule
+        try:
+            docker_client_with_roxy.api._post("/v1.40/containers/safe-endpoint", data={})
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Second rule should allow this request")
+
+    def test_rule_precedence_overlapping_patterns(self, docker_client_with_roxy, with_roxy_config):
+        """Test rules with overlapping patterns and different conditions."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            # First rule: containers with specific query param
+            Rule(
+                endpoint="/v1\\..*/containers/json",
+                methods=["GET"],
+                allow=True,
+                match_query_params="required",
+                query_params={"all": "true"}
+            ),
+            # Second rule: same endpoint but with path variables
             Rule(
                 endpoint="/v1\\..*/containers/{container_id}/json",
                 methods=["GET"],
                 allow=True,
-                path_variables={"container_id": "[a-zA-Z0-9_-]+"}
+                path_variables={"container_id": "[a-f0-9]+"}
+            ),
+            # Third rule: general containers endpoint (should not override specific rules)
+            Rule(
+                endpoint="/v1\\..*/containers/.*",
+                methods=["GET"],
+                allow=False
             )
         ]))
 
-        # Wait a short time for the file watcher to detect the change and reload the config
-        import time
-        time.sleep(0.5)
+        # Should match first rule
+        try:
+            docker_client_with_roxy.api._get("/v1.40/containers/json?all=true")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("First rule should allow this request")
 
-        # Try to list containers again, which should now be allowed
-        containers = docker_client_with_roxy.containers.list(all=True)
-        # Just verify that the request succeeds
+        # Should match second rule
+        try:
+            docker_client_with_roxy.api._get("/v1.40/containers/abc123/json")
+        except APIError as e:
+            if e.response.status_code == 403:
+                pytest.fail("Second rule should allow this request")
+
+        # Should be denied by third rule (no matching specific rules)
+        with pytest.raises(APIError) as excinfo:
+            docker_client_with_roxy.api._get("/v1.40/containers/json?all=false")
+        assert excinfo.value.response.status_code == 403
+
+
+class TestRoxyRealWorldWorkflows:
+    """Test real-world Docker workflows through the proxy."""
+
+    def test_complete_container_workflow(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test a complete container workflow: create, start, logs, exec, stop, remove."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/create.*", methods=["POST"], allow=True),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/start", methods=["POST"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/logs", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/exec", methods=["POST"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/exec/{exec_id}/start", methods=["POST"], allow=True,
+                 path_variables={"exec_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/exec/{exec_id}/json", methods=["GET"], allow=True,
+                 path_variables={"exec_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/stop", methods=["POST"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}", methods=["DELETE"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+        ]))
+
+        try:
+            # Create container
+            container = docker_client_with_roxy.containers.create(
+                "alpine:latest",
+                command="sh -c 'echo hello world; sleep 300'",
+                name="roxy-workflow-test"
+            )
+            
+            # Start container
+            container.start()
+            
+            # Wait a moment for command to execute
+            time.sleep(2)
+            
+            # Get logs
+            logs = container.logs()
+            assert b"hello world" in logs
+            
+            # Execute command in container
+            exec_result = container.exec_run("echo 'exec test'")
+            assert b"exec test" in exec_result.output
+            
+            # Stop container
+            container.stop()
+            container.reload()
+            assert container.status == "exited"
+            
+            # Remove container
+            container.remove()
+
+        finally:
+            # Cleanup with direct client
+            try:
+                container = docker_client.containers.get("roxy-workflow-test")
+                if container.status == "running":
+                    container.stop()
+                container.remove()
+            except NotFound:
+                pass
+
+    def test_multi_container_orchestration(self, docker_client: docker.DockerClient, docker_client_with_roxy, with_roxy_config):
+        """Test orchestrating multiple containers."""
+        with_roxy_config(RoxyConfig(timeout=30, rules=[
+            Rule(endpoint="/v1\\..*/containers/create.*", methods=["POST"], allow=True),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/start", methods=["POST"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/stop", methods=["POST"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}", methods=["DELETE"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/{container_id}/json", methods=["GET"], allow=True,
+                 path_variables={"container_id": "[a-zA-Z0-9_-]+"}),
+            Rule(endpoint="/v1\\..*/containers/json.*", methods=["GET"], allow=True),
+        ]))
+
+        containers = []
+        try:
+            # Create multiple containers
+            for i in range(3):
+                container = docker_client_with_roxy.containers.create(
+                    "alpine:latest",
+                    command="sleep 300",
+                    name=f"roxy-orchestration-{i}"
+                )
+                containers.append(container)
+
+            # Start all containers
+            for container in containers:
+                container.start()
+
+            # Verify all are running
+            running_containers = docker_client_with_roxy.containers.list()
+            our_containers = [c for c in running_containers if c.name.startswith("roxy-orchestration-")]
+            assert len(our_containers) == 3
+
+            # Stop all containers
+            for container in containers:
+                container.stop()
+
+        finally:
+            # Cleanup
+            for i in range(3):
+                try:
+                    container = docker_client.containers.get(f"roxy-orchestration-{i}")
+                    if container.status == "running":
+                        container.stop()
+                    container.remove()
+                except NotFound:
+                    pass

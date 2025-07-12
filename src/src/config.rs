@@ -48,7 +48,6 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

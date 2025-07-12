@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use hyper::{Body, Method, Request};
@@ -66,7 +64,7 @@ pub fn is_regex(pattern: &str) -> bool {
     }
 
     // Check for special characters first - this is a fast check that avoids regex compilation
-    let has_special_chars = SPECIAL_CHARS.iter().any(|&c| pattern.contains(c));
+    let has_special_chars = pattern.chars().any(|c| SPECIAL_CHARS.contains(&c));
 
     // Only try to compile as regex if it has special characters
     if has_special_chars {
@@ -380,7 +378,7 @@ impl Rule {
         debug!("Parsing query string: {}", query_str);
 
         // Use owned strings to avoid lifetime issues
-        let mut query_pairs: Vec<(String, String)> = Vec::with_capacity(query_str.split('&').count());
+        let mut query_pairs = Vec::with_capacity(query_str.split('&').count());
         for pair in query_str.split('&') {
             let mut parts = pair.split('=');
 
@@ -823,7 +821,6 @@ async fn matches_buffered(rule: &Rule, req: &BufferedRequest, process_info: &Pro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::http::uri::Uri;
     use std::collections::HashMap;
     use bytes::Bytes;
 

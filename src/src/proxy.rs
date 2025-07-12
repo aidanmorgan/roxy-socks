@@ -332,8 +332,10 @@ async fn handle_request(
                 }
 
                 // Create the final request with error handling
-                let docker_req = builder.body(body).unwrap_or_else(|e| {
+                let docker_req = builder.body(body).map_err(|e| {
                     error!("Failed to build Docker request: {}", e);
+                    anyhow::anyhow!("Failed to build Docker request: {}", e)
+                }).unwrap_or_else(|_| {
                     // This should rarely happen, but provide a fallback
                     Request::new(Body::empty())
                 });
@@ -460,12 +462,9 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{QueryParamMatch, Rule, RuleCheckResult};
+    use crate::rules::{QueryParamMatch, Rule};
     use hyper::body::to_bytes;
-    use std::collections::HashMap;
     use tempfile::TempDir;
-    use tokio::fs::File;
-    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_handle_request_allowed() {
